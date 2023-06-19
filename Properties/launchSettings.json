@@ -1,11 +1,31 @@
 {
   "profiles": {
-    "UA-CloudAction": {
-      "commandName": "Project"
+    "UA_CloudAction": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "dotnetRunMessages": true,
+      "applicationUrl": "https://localhost:7058;http://localhost:5245"
+    },
+    "IIS Express": {
+      "commandName": "IISExpress",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      }
     },
     "Docker": {
       "commandName": "Docker",
+      "launchBrowser": true,
+      "launchUrl": "{Scheme}://{ServiceHost}:{ServicePort}",
+      "publishAllPorts": true,
+      "useSSL": true,
       "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "ADMIN_USERNAME": "erichb",
+        "ADMIN_PASSWORD": "erichb2",
         "ADX_INSTANCE_URL": "https://ontologies.eastus2.kusto.windows.net",
         "ADX_DB_NAME": "ontologies",
         "ADX_TABLE_NAME": "opcua_telemetry",
@@ -23,6 +43,14 @@
         "UA_SERVER_APPLICATION_NAME": "assembly",
         "UA_SERVER_LOCATION_NAME": "seattle"
       }
+    }
+  },
+  "iisSettings": {
+    "windowsAuthentication": false,
+    "anonymousAuthentication": true,
+    "iisExpress": {
+      "applicationUrl": "http://localhost:51195",
+      "sslPort": 44305
     }
   }
 }
