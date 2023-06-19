@@ -4,7 +4,7 @@ An OPC UA Cloud-based Action reference implementation which calls UA Cloud Comma
 
 The scenario implemented is closely tied to the OPC UA PubSub telemetry stored in Azure Data Explorer, as provided in the [Manufacturing Ontologies](https://github.com/digitaltwinconsortium/ManufacturingOntologies) reference implementation. There, the "digital feedback loop" is implemented by triggering a command on one of the OPC UA servers in the factory simulation from the cloud, based on a OPC UA time-series of a machine reaching a certain threshold (the simulated pressure).
 
-Note: Docker containers are automatically built and available under "packages".
+Note: Docker containers are automatically built and available on GitHub under "Packages".
 
 Note: When running on Azure, you need to register UA-CloudAction as an app with Active Directory, see [here](https://learn.microsoft.com/en-us/azure/active-directory/develop/quickstart-register-app).
 
