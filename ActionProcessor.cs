@@ -77,6 +77,12 @@ namespace UACloudAction
                                 // ignore this field and move on
                             }
                         }
+
+                        if (!allowMultiRow && (values.Count > 0))
+                        {
+                            // we got a value
+                            break;
+                        }
                     }
                 }
             }
