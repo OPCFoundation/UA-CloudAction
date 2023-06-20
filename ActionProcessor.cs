@@ -33,15 +33,29 @@ namespace UACloudAction
 
                     // acquire OAuth2 token via AAD REST endpoint
                     webClient = new HttpClient();
-                    webClient.DefaultRequestHeaders.Add("Accept", "application/json");
+                    HttpResponseMessage responseMessage;
+                    string restResponse = string.Empty;
 
-                    string content = $"grant_type=client_credentials&resource={adxInstanceURL}&client_id={applicationClientId}&client_secret={applicationKey}";
-                    HttpResponseMessage responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Post, "https://login.microsoftonline.com/" + tenantId + "/oauth2/token")
+                    // check if we are supposed to use a managed identity
+                    if (string.IsNullOrEmpty(applicationKey))
                     {
-                        Content = new StringContent(content, Encoding.UTF8, "application/x-www-form-urlencoded")
-                    });
+                        // access the Azure Instance Metadata Service (IMDS) endpoint for the token (only works from VMs running on Azure)
+                        webClient.DefaultRequestHeaders.Add("Metadata", "true");
+                        responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Get, "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"));
+                        restResponse = responseMessage.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    }
+                    else
+                    {
+                        // use the application key provided with the default AAD endpoint
+                        webClient.DefaultRequestHeaders.Add("Accept", "application/json");
+                        string content = $"grant_type=client_credentials&resource={adxInstanceURL}&client_id={applicationClientId}&client_secret={applicationKey}";
+                        responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Post, "https://login.microsoftonline.com/" + tenantId + "/oauth2/token")
+                        {
+                            Content = new StringContent(content, Encoding.UTF8, "application/x-www-form-urlencoded")
+                        });
 
-                    string restResponse = responseMessage.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                        restResponse = responseMessage.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    }
 
                     // call ADX REST endpoint with query
                     string query = "opcua_metadata_lkv"
