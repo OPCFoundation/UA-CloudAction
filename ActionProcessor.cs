@@ -39,9 +39,9 @@ namespace UACloudAction
                     // check if we are supposed to use a managed identity
                     if (string.IsNullOrEmpty(applicationKey))
                     {
-                        // access the Azure Instance Metadata Service (IMDS) endpoint for the token (only works from VMs running on Azure)
-                        webClient.DefaultRequestHeaders.Add("Metadata", "true");
-                        responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Get, "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"));
+                        // access the internal REST endpoint for token retrieval (only works from Azure App services)
+                        webClient.DefaultRequestHeaders.Add("X-IDENTITY-HEADER", "853b9a84-5bfa-4b22-a3f3-0b9a43d9ad8a");
+                        responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Get, "http://localhost:4141/MSI/token?resource=https://vault.azure.net&api-version=2019-08-01"));
                         restResponse = responseMessage.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                     }
                     else
