@@ -144,7 +144,7 @@ namespace UACloudAction
                                  + "| extend NodeValue = toint(Value)"
                                  + "| project Timestamp, NodeValue"
                                  + "| order by Timestamp desc"
-                                 + "| where NodeValue > 4000";
+                                 + "| where NodeValue > 2600";
 
                     Dictionary<string, object> _values = new Dictionary<string, object>();
                     RunADXQuery(query, _values);
