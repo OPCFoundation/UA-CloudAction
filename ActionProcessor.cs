@@ -139,12 +139,12 @@ namespace UACloudAction
                                  + "| where Name contains '" + uaServerLocationName + "'"
                                  + "| join kind = inner(opcua_telemetry"
                                  + "    | where Name == 'Pressure'"
-                                 + "    | where Timestamp > now() - 10m" // TimeStamp is when the data was generated in the UA server, so we take cloud ingestion time into account!"
+                                 + "    | where Timestamp > now() - 1m" // TimeStamp is when the data was generated in the UA server, so we take cloud ingestion time into account!"
                                  + ") on DataSetWriterID"
                                  + "| extend NodeValue = toint(Value)"
                                  + "| project Timestamp, NodeValue"
                                  + "| order by Timestamp desc"
-                                 + "| where NodeValue > 2600";
+                                 + "| where NodeValue > 2700";
 
                     Dictionary<string, object> _values = new Dictionary<string, object>();
                     RunADXQuery(query, _values);
