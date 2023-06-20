@@ -2,18 +2,93 @@
 namespace UACloudAction
 {
     using Confluent.Kafka;
+    using Kusto.Data;
+    using Kusto.Data.Common;
+    using Kusto.Data.Net.Client;
     using Newtonsoft.Json;
-    using Newtonsoft.Json.Linq;
+    using System.Data;
     using System.Text;
 
     public class ActionProcessor
     {
-        HttpClient webClient = new HttpClient();
-        IProducer<Null, string>? producer = null;
-        IConsumer<Ignore, byte[]>? consumer = null;
+        public bool Running { get; set; } = false;
+
+        public bool ConnectionToADX { get; set; } = false;
+
+        public bool ConnectionToBroker { get; set; } = false;
+
+        public bool ConnectionToUACloudCommander { get; set; } = false;
+
+        private ICslQueryProvider? _queryProvider = null;
+        private IProducer<Null, string>? _producer = null;
+        private IConsumer<Ignore, byte[]>? _consumer = null;
+
+        private void RunADXQuery(string query, Dictionary<string, object> values, bool allowMultiRow = false)
+        {
+            ClientRequestProperties clientRequestProperties = new ClientRequestProperties()
+            {
+                ClientRequestId = Guid.NewGuid().ToString()
+            };
+
+            try
+            {
+                using (IDataReader? reader = _queryProvider?.ExecuteQuery(query, clientRequestProperties))
+                {
+                    while ((reader != null) && reader.Read())
+                    {
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            try
+                            {
+                                if (reader.GetValue(i) != null)
+                                {
+                                    if (!allowMultiRow)
+                                    {
+                                        if (values.ContainsKey(reader.GetName(i)))
+                                        {
+                                            values[reader.GetName(i)] = reader.GetValue(i);
+                                        }
+                                        else
+                                        {
+                                            values.TryAdd(reader.GetName(i), reader.GetValue(i));
+                                        }
+                                    }
+                                    else
+                                    {
+                                        string? value = reader.GetValue(i).ToString();
+                                        if (value != null)
+                                        {
+                                            if (values.ContainsKey(value))
+                                            {
+                                                values[value] = reader.GetValue(i);
+                                            }
+                                            else
+                                            {
+                                                values.TryAdd(value, reader.GetValue(i));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine(ex.Message);
+
+                                // ignore this field and move on
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+            }
+        }
 
         public void Run()
         {
+            Running = true;
 
             while (true)
             {
@@ -31,30 +106,25 @@ namespace UACloudAction
                     string? uaServerApplicationName = Environment.GetEnvironmentVariable("UA_SERVER_APPLICATION_NAME");
                     string? uaServerLocationName = Environment.GetEnvironmentVariable("UA_SERVER_LOCATION_NAME");
 
-                    // acquire OAuth2 token via AAD REST endpoint
-                    webClient = new HttpClient();
-                    HttpResponseMessage responseMessage;
-                    string restResponse = string.Empty;
-
-                    // check if we are supposed to use a managed identity
-                    if (string.IsNullOrEmpty(applicationKey))
+                    // acquire access to ADX token Kusto SDK
+                    if (!string.IsNullOrEmpty(adxInstanceURL) && !string.IsNullOrEmpty(adxDatabaseName) && !string.IsNullOrEmpty(applicationClientId))
                     {
-                        // access the internal REST endpoint for token retrieval (only works from Azure App services)
-                        webClient.DefaultRequestHeaders.Add("X-IDENTITY-HEADER", "853b9a84-5bfa-4b22-a3f3-0b9a43d9ad8a");
-                        responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Get, "http://localhost:4141/MSI/token?resource=https://vault.azure.net&api-version=2019-08-01"));
-                        restResponse = responseMessage.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                        KustoConnectionStringBuilder connectionString;
+                        if (!string.IsNullOrEmpty(applicationKey) && !string.IsNullOrEmpty(tenantId))
+                        {
+                            connectionString = new KustoConnectionStringBuilder(adxInstanceURL.Replace("https://", string.Empty), adxDatabaseName).WithAadApplicationKeyAuthentication(applicationClientId, applicationKey, tenantId);
+                        }
+                        else
+                        {
+                            connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName).WithAadUserManagedIdentity(applicationClientId);
+                        }
+
+                        _queryProvider = KustoClientFactory.CreateCslQueryProvider(connectionString);
+                        ConnectionToADX = (_queryProvider != null);
                     }
                     else
                     {
-                        // use the application key provided with the default AAD endpoint
-                        webClient.DefaultRequestHeaders.Add("Accept", "application/json");
-                        string content = $"grant_type=client_credentials&resource={adxInstanceURL}&client_id={applicationClientId}&client_secret={applicationKey}";
-                        responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Post, "https://login.microsoftonline.com/" + tenantId + "/oauth2/token")
-                        {
-                            Content = new StringContent(content, Encoding.UTF8, "application/x-www-form-urlencoded")
-                        });
-
-                        restResponse = responseMessage.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                        Console.WriteLine("Environment variables not set!");
                     }
 
                     // call ADX REST endpoint with query
@@ -70,17 +140,12 @@ namespace UACloudAction
                                  + "| order by Timestamp desc"
                                  + "| where NodeValue > 4000";
 
-                    webClient.DefaultRequestHeaders.Remove("Accept");
-                    webClient.DefaultRequestHeaders.Add("Authorization", "bearer " + JObject.Parse(restResponse)["access_token"]?.ToString());
-                    responseMessage = webClient.Send(new HttpRequestMessage(HttpMethod.Post, adxInstanceURL + "/v2/rest/query")
-                    {
-                        Content = new StringContent("{ \"db\":\"" + adxDatabaseName + "\", \"csl\":\"" + query + "\" }", Encoding.UTF8, "application/json")
-                    });
+                    Dictionary<string, object> _values = new Dictionary<string, object>();
+                    RunADXQuery(query, _values);
 
-                    restResponse = responseMessage.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                    if (restResponse.Contains("dtmi:digitaltwins:opcua:node:double"))
+                    if ((_values.Count > 1) && _values.ContainsKey("NodeValue"))
                     {
-                        Console.WriteLine("High pressure detected!");
+                        Console.WriteLine("High pressure detected: " + _values["NodeValue"].ToString());
 
                         // call OPC UA method on UA Server via UACommander via Event Hubs
                         RequestModel request = new()
@@ -104,7 +169,7 @@ namespace UACloudAction
                             SaslPassword = Environment.GetEnvironmentVariable("BROKER_PASSWORD"),
                         };
 
-                        producer = new ProducerBuilder<Null, string>(config).Build();
+                        _producer = new ProducerBuilder<Null, string>(config).Build();
 
                         var conf = new ConsumerConfig
                         {
@@ -117,23 +182,25 @@ namespace UACloudAction
                             SaslPassword = Environment.GetEnvironmentVariable("BROKER_PASSWORD")
                         };
 
-                        consumer = new ConsumerBuilder<Ignore, byte[]>(conf).Build();
+                        _consumer = new ConsumerBuilder<Ignore, byte[]>(conf).Build();
 
-                        consumer.Subscribe(Environment.GetEnvironmentVariable("RESPONSE_TOPIC"));
+                        _consumer.Subscribe(Environment.GetEnvironmentVariable("RESPONSE_TOPIC"));
 
                         Message<Null, string> message = new()
                         {
                             Headers = new Headers() { { "Content-Type", Encoding.UTF8.GetBytes("application/json") } },
                             Value = JsonConvert.SerializeObject(request)
                         };
-                        producer.ProduceAsync(Environment.GetEnvironmentVariable("TOPIC"), message).GetAwaiter().GetResult();
+                        _producer.ProduceAsync(Environment.GetEnvironmentVariable("TOPIC"), message).GetAwaiter().GetResult();
+
+                        ConnectionToBroker = true;
 
                         Console.WriteLine($"Sent command {JsonConvert.SerializeObject(request)} to UA Cloud Commander.");
 
                         // wait for up to 15 seconds for the response
                         while (true)
                         {
-                            ConsumeResult<Ignore, byte[]> result = consumer.Consume(15 * 1000);
+                            ConsumeResult<Ignore, byte[]> result = _consumer.Consume(15 * 1000);
                             if (result != null)
                             {
                                 ResponseModel? response;
@@ -146,6 +213,8 @@ namespace UACloudAction
                                     // ignore message
                                     continue;
                                 }
+
+                                ConnectionToUACloudCommander = true;
 
                                 if (response?.CorrelationId == request.CorrelationId)
                                 {
@@ -168,28 +237,32 @@ namespace UACloudAction
                             }
                         }
 
-                        consumer.Unsubscribe();
+                        _consumer.Unsubscribe();
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine(ex.Message);
+
+                    ConnectionToADX = false;
+                    ConnectionToBroker = false;
+                    ConnectionToUACloudCommander = false;
                 }
                 finally
                 {
-                    if (producer != null)
+                    if (_producer != null)
                     {
-                        producer.Dispose();
+                        _producer.Dispose();
                     }
 
-                    if (consumer != null)
+                    if (_consumer != null)
                     {
-                        consumer.Dispose();
+                        _consumer.Dispose();
                     }
 
-                    if (webClient != null)
+                    if (_queryProvider != null)
                     {
-                        webClient.Dispose();
+                        _queryProvider.Dispose();
                     }
                 }
             }

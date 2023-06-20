@@ -1,7 +1,14 @@
-﻿@{
+﻿@model StatusModel
+
+@{
     ViewData["Title"] = "UA-CloudAction";
 }
 
 <div class="text-center">
     <h1 class="display-4">UA Cloud Action</h1>
+    <hr />
+    Status: @Model.Status<br />
+    Connected to ADX: @Model.ConnectionToADX<br />
+    Connected to Broker: @Model.ConnectionToBroker<br />
+    Connected to UA Cloud Commander: @Model.ConnectionToUACloudCommander<br />
 </div>
