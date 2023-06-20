@@ -10,6 +10,8 @@ Note: When running on Azure, you need to register UA-CloudAction as an app with 
 
 ## Environment Variables that Must be Defined
 
+* ADMIN_USERNAME - the username to use to login to the service
+* ADMIN_PASSWORD - the password for the username
 * ADX_INSTANCE_URL - the endpoint of your ADX cluster, e.g. https://ontologies.eastus2.kusto.windows.net/
 * ADX_DB_NAME - the name of your ADX database
 * ADX_TABLE_NAME - the name of your ADX table
