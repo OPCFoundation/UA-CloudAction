@@ -156,7 +156,7 @@ namespace UACloudAction
                         // call OPC UA method on UA Server via UACommander via Event Hubs
                         RequestModel request = new()
                         {
-                            Command = "methodcall",
+                            Command = "MethodCall",
                             TimeStamp = DateTime.UtcNow,
                             CorrelationId = Guid.NewGuid(),
                             Endpoint = Environment.GetEnvironmentVariable("UA_SERVER_ENDPOINT"),
