@@ -135,12 +135,12 @@ namespace UACloudAction
 
                     // call ADX REST endpoint with query
                     string query = "opcua_metadata_lkv"
-                                 + "| where Name contains '" + uaServerApplicationName + "'"
-                                 + "| where Name contains '" + uaServerLocationName + "'"
+                                 + "| where DataSetName contains '" + uaServerApplicationName + "'"
+                                 + "| where DataSetName contains '" + uaServerLocationName + "'"
                                  + "| join kind = inner(opcua_telemetry"
                                  + "    | where Name == 'Pressure'"
                                  + "    | where Timestamp > now() - 1m" // TimeStamp is when the data was generated in the UA server, so we take cloud ingestion time into account!"
-                                 + ") on DataSetWriterID"
+                                 + ") on Subject"
                                  + "| extend NodeValue = toint(Value)"
                                  + "| project Timestamp, NodeValue"
                                  + "| order by Timestamp desc"
