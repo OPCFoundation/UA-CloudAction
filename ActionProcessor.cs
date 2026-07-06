@@ -5,9 +5,10 @@ namespace UACloudAction
     using Kusto.Data;
     using Kusto.Data.Common;
     using Kusto.Data.Net.Client;
-    using Newtonsoft.Json;
     using System.Data;
     using System.Text;
+    using System.Text.Json;
+    using System.Text.Json.Serialization;
 
     public class ActionProcessor
     {
@@ -22,6 +23,12 @@ namespace UACloudAction
         private ICslQueryProvider? _queryProvider = null;
         private IProducer<Null, string>? _producer = null;
         private IConsumer<Ignore, byte[]>? _consumer = null;
+
+        private static readonly JsonSerializerOptions _jsonOptions = new()
+        {
+            PropertyNameCaseInsensitive = true,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
 
         private void RunADXQuery(string query, Dictionary<string, object> values, bool allowMultiRow = false)
         {
@@ -153,15 +160,35 @@ namespace UACloudAction
                     {
                         Console.WriteLine("High pressure detected: " + _values["NodeValue"].ToString());
 
-                        // call OPC UA method on UA Server via UACommander via Event Hubs
-                        RequestModel request = new()
+                        // build a spec-compliant OPC UA PubSub MethodCall ActionRequest (OPC 10000-14, 7.2.5.6)
+                        byte[] correlationData = Guid.NewGuid().ToByteArray();
+
+                        ActionNetworkMessage request = new()
                         {
-                            Command = "MethodCall",
-                            TimeStamp = DateTime.UtcNow,
-                            CorrelationId = Guid.NewGuid(),
-                            Endpoint = Environment.GetEnvironmentVariable("UA_SERVER_ENDPOINT"),
-                            MethodNodeId = Environment.GetEnvironmentVariable("UA_SERVER_METHOD_ID"),
-                            ParentNodeId = Environment.GetEnvironmentVariable("UA_SERVER_OBJECT_ID")
+                            MessageId = Guid.NewGuid().ToString(),
+                            MessageType = ActionMessageTypes.Request,
+                            PublisherId = Environment.GetEnvironmentVariable("UA_CLOUD_COMMANDER_ID") ?? "UACloudCommander", // the Responder
+                            Timestamp = DateTime.UtcNow,
+                            ResponseAddress = Environment.GetEnvironmentVariable("RESPONSE_TOPIC"), // where the Responder sends the ActionResponse
+                            CorrelationData = correlationData,
+                            RequestorId = Environment.GetEnvironmentVariable("REQUESTOR_ID") ?? "UACloudAction",
+                            TimeoutHint = 15000,
+                            Messages = new List<ActionDataSetMessage>
+                            {
+                                new()
+                                {
+                                    DataSetWriterId = 1,
+                                    ActionTargetId = (ushort)CommanderActionTarget.MethodCall,
+                                    RequestId = 1,
+                                    ActionState = ActionState.Executing,
+                                    Payload = JsonSerializer.SerializeToElement(new
+                                    {
+                                        Endpoint = Environment.GetEnvironmentVariable("UA_SERVER_ENDPOINT"),
+                                        MethodNodeId = Environment.GetEnvironmentVariable("UA_SERVER_METHOD_ID"),
+                                        ParentNodeId = Environment.GetEnvironmentVariable("UA_SERVER_OBJECT_ID")
+                                    }, _jsonOptions)
+                                }
+                            }
                         };
 
                         // create Kafka client
@@ -192,16 +219,18 @@ namespace UACloudAction
 
                         _consumer.Subscribe(Environment.GetEnvironmentVariable("RESPONSE_TOPIC"));
 
+                        string requestJson = JsonSerializer.Serialize(request, _jsonOptions);
+
                         Message<Null, string> message = new()
                         {
                             Headers = new Headers() { { "Content-Type", Encoding.UTF8.GetBytes("application/json") } },
-                            Value = JsonConvert.SerializeObject(request)
+                            Value = requestJson
                         };
                         _producer.ProduceAsync(Environment.GetEnvironmentVariable("TOPIC"), message).GetAwaiter().GetResult();
 
                         ConnectionToBroker = true;
 
-                        Console.WriteLine($"Sent command {JsonConvert.SerializeObject(request)} to UA Cloud Commander.");
+                        Console.WriteLine($"Sent ActionRequest {requestJson} to UA Cloud Commander.");
 
                         // wait for up to 15 seconds for the response
                         while (true)
@@ -209,10 +238,10 @@ namespace UACloudAction
                             ConsumeResult<Ignore, byte[]> result = _consumer.Consume(15 * 1000);
                             if (result != null)
                             {
-                                ResponseModel? response;
+                                ActionNetworkMessage? response;
                                 try
                                 {
-                                    response = JsonConvert.DeserializeObject<ResponseModel>(Encoding.UTF8.GetString(result.Message.Value));
+                                    response = JsonSerializer.Deserialize<ActionNetworkMessage>(Encoding.UTF8.GetString(result.Message.Value), _jsonOptions);
                                 }
                                 catch (Exception)
                                 {
@@ -220,21 +249,31 @@ namespace UACloudAction
                                     continue;
                                 }
 
+                                // only process ua-action-response NetworkMessages that correlate to our request
+                                if ((response == null)
+                                 || (response.MessageType != ActionMessageTypes.Response)
+                                 || (response.CorrelationData == null)
+                                 || !response.CorrelationData.SequenceEqual(correlationData))
+                                {
+                                    continue;
+                                }
+
                                 ConnectionToUACloudCommander = true;
 
-                                if (response?.CorrelationId == request.CorrelationId)
+                                ActionDataSetMessage? responseMessage = response.Messages?.FirstOrDefault();
+                                if ((responseMessage != null) && (responseMessage.Status == 0)) // 0 = StatusCode Good
                                 {
-                                    if (response.Success)
-                                    {
-                                        Console.WriteLine("Command successfully sent!");
-                                    }
-                                    else
-                                    {
-                                        Console.WriteLine($"Response received but result is failure: {response.Status}.");
-                                    }
-
-                                    break;
+                                    string? resultValue = GetPayloadString(responseMessage.Payload, "Result");
+                                    Console.WriteLine($"Command successfully executed! Result: {resultValue}");
                                 }
+                                else
+                                {
+                                    string? error = (responseMessage != null) ? GetPayloadString(responseMessage.Payload, "Error") : null;
+                                    string statusText = "0x" + (responseMessage?.Status ?? 0).ToString("X8");
+                                    Console.WriteLine($"Response received but result is failure: {error ?? statusText}.");
+                                }
+
+                                break;
                             }
                             else
                             {
@@ -272,6 +311,16 @@ namespace UACloudAction
                     }
                 }
             }
+        }
+
+        private static string? GetPayloadString(JsonElement payload, string name)
+        {
+            if ((payload.ValueKind == JsonValueKind.Object) && payload.TryGetProperty(name, out JsonElement value))
+            {
+                return value.ToString();
+            }
+
+            return null;
         }
     }
 }
