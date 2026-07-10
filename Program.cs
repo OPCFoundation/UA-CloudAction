@@ -1,10 +1,19 @@
 
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.HttpOverrides;
 using UACloudAction;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddControllersWithViews();
+
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    // The Azure Container Apps ingress proxy is not in the default known networks/proxies list.
+    options.KnownIPNetworks.Clear();
+    options.KnownProxies.Clear();
+});
 
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
     .AddCookie(options =>
@@ -20,11 +29,11 @@ builder.Services.AddSingleton<ActionProcessor>();
 
 var app = builder.Build();
 
+app.UseForwardedHeaders();
+
 app.UseHsts();
 
 app.UseHttpsRedirection();
-
-app.UseForwardedHeaders();
 
 app.UseStaticFiles();
 

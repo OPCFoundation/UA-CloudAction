@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <RootNamespace>UACloudAction</RootNamespace>
     <UserSecretsId>9760dabc-6005-45a3-a819-6aa19833dfa0</UserSecretsId>
     <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>

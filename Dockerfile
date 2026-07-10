@@ -2,6 +2,11 @@
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
 WORKDIR /app
+# The .NET 8+ ASP.NET base images listen on 8080 by default. Force the app to
+# listen on port 80 so it matches the Container Apps ingress/startup probe (TLS is
+# terminated at the ingress there). HTTPS (443) is exposed for other hosts that
+# supply a certificate at runtime (e.g. Visual Studio mounts the dev cert).
+ENV ASPNETCORE_HTTP_PORTS=80
 EXPOSE 80
 EXPOSE 443
 
