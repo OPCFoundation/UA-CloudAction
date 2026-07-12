@@ -180,7 +180,7 @@ namespace UACloudAction
                         }
                         else
                         {
-                            SendRequestViaKafka(requestJson, correlationData);
+                            SendRequestViaKafka(requestJson, correlationData, request);
                         }
                     }
                 }
@@ -212,7 +212,7 @@ namespace UACloudAction
             }
         }
 
-        private void SendRequestViaKafka(string requestJson, byte[] correlationData)
+        private void SendRequestViaKafka(string requestJson, byte[] correlationData, ActionNetworkMessage request)
         {
             // create Kafka client
             var config = new ProducerConfig
@@ -242,16 +242,62 @@ namespace UACloudAction
 
             _consumer.Subscribe(Environment.GetEnvironmentVariable("RESPONSE_TOPIC"));
 
-            Message<Null, string> message = new()
+            // KAFKA_TARGET selects how the Event Hubs message is shaped:
+            //  - "AIOCommander": the message is consumed by an Azure IoT Operations data flow that republishes
+            //    it onto the built-in OPC UA connector commander's MQTT-RPC action topic. That endpoint requires
+            //    a JSON method-arguments body plus MQTT v5 Correlation Data / Response Topic / Content Type
+            //    properties. The data flow (copyMqttProperties=Enabled) maps the Kafka user headers set below
+            //    onto those MQTT v5 properties, and a reverse data flow forwards the commander's reply back to
+            //    the RESPONSE_TOPIC Event Hub this consumer listens on. Header names must be exactly
+            //    "Correlation Data", "Response Topic" and "Content Type" (the AIO Kafka<->MQTTv5 mapping).
+            //  - anything else (default): the message targets a UA Cloud Commander instance directly and carries
+            //    the full OPC UA PubSub ActionRequest envelope (backwards-compatible Option C fallback).
+            string kafkaTarget = Environment.GetEnvironmentVariable("KAFKA_TARGET") ?? "UACloudCommander";
+            bool aioCommander = kafkaTarget.Equals("AIOCommander", StringComparison.OrdinalIgnoreCase);
+
+            Message<Null, string> message;
+            if (aioCommander)
             {
-                Headers = new Headers() { { "Content-Type", Encoding.UTF8.GetBytes("application/json") } },
-                Value = requestJson
-            };
+                // method-arguments object; the pressure-relief method is parameter-less, so send an empty object
+                string argumentsJson = SerializeMethodArguments(request);
+
+                // The MQTT v5 Response Topic the AIO commander must reply on. This is the in-cluster MQTT topic
+                // that the reverse data flow subscribes to and forwards to the RESPONSE_TOPIC Event Hub that this
+                // consumer reads. It differs from RESPONSE_TOPIC (the Event Hub name), so it has its own variable;
+                // it falls back to RESPONSE_TOPIC when not set for backwards compatibility.
+                string? responseTopic = Environment.GetEnvironmentVariable("RESPONSE_MQTT_TOPIC")
+                    ?? Environment.GetEnvironmentVariable("RESPONSE_TOPIC");
+
+                Headers headers = new()
+                {
+                    { "Correlation Data", correlationData },
+                    { "Content Type", Encoding.UTF8.GetBytes("application/json") }
+                };
+                if (!string.IsNullOrEmpty(responseTopic))
+                {
+                    headers.Add("Response Topic", Encoding.UTF8.GetBytes(responseTopic));
+                }
+
+                message = new()
+                {
+                    Headers = headers,
+                    Value = argumentsJson
+                };
+            }
+            else
+            {
+                message = new()
+                {
+                    Headers = new Headers() { { "Content-Type", Encoding.UTF8.GetBytes("application/json") } },
+                    Value = requestJson
+                };
+            }
+
             _producer.ProduceAsync(Environment.GetEnvironmentVariable("TOPIC"), message).GetAwaiter().GetResult();
 
             ConnectionToBroker = true;
 
-            Console.WriteLine($"Sent ActionRequest {requestJson} to UA Cloud Commander.");
+            Console.WriteLine($"Sent {(aioCommander ? "RPC command" : "ActionRequest")} {message.Value} to UA Cloud Commander.");
 
             // wait for up to 15 seconds for the response
             while (true)
@@ -259,7 +305,10 @@ namespace UACloudAction
                 ConsumeResult<Ignore, byte[]> result = _consumer.Consume(15 * 1000);
                 if (result != null)
                 {
-                    if (HandleResponse(Encoding.UTF8.GetString(result.Message.Value), correlationData))
+                    bool handled = aioCommander
+                        ? HandleAioResponse(result.Message, correlationData)
+                        : HandleResponse(Encoding.UTF8.GetString(result.Message.Value), correlationData);
+                    if (handled)
                     {
                         break;
                     }
@@ -454,6 +503,42 @@ namespace UACloudAction
                     }
                 }
             };
+        }
+
+        private static string SerializeMethodArguments(ActionNetworkMessage request)
+        {
+            // The AIO OPC UA commander expects the JSON method-arguments object as the request body. The
+            // pressure-relief method takes no input arguments, so an empty object is sent. Additional
+            // arguments (if any were ever added to BuildActionRequest) would be serialized here.
+            _ = request;
+            return "{}";
+        }
+
+        private bool HandleAioResponse(Message<Ignore, byte[]> responseMessage, byte[] correlationData)
+        {
+            // The AIO OPC UA commander replies to the MQTT-RPC call on the request's Response Topic; a reverse
+            // data flow forwards that reply to the RESPONSE_TOPIC Event Hub. copyMqttProperties maps the MQTT v5
+            // Correlation Data back to a Kafka "Correlation Data" user header, so correlation is done on the
+            // header (the body is the raw method result, not an ActionNetworkMessage envelope).
+            byte[]? responseCorrelation = null;
+            if (responseMessage.Headers != null
+             && responseMessage.Headers.TryGetLastBytes("Correlation Data", out byte[] headerBytes))
+            {
+                responseCorrelation = headerBytes;
+            }
+
+            if ((responseCorrelation == null) || !responseCorrelation.SequenceEqual(correlationData))
+            {
+                // not our response
+                return false;
+            }
+
+            ConnectionToUACloudCommander = true;
+
+            string resultJson = (responseMessage.Value != null) ? Encoding.UTF8.GetString(responseMessage.Value) : string.Empty;
+            Console.WriteLine($"Command successfully executed! Result: {resultJson}");
+
+            return true;
         }
 
         private bool HandleResponse(string responseJson, byte[] correlationData)
