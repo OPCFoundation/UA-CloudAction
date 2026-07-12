@@ -268,6 +268,13 @@ namespace UACloudAction
                 string? responseTopic = Environment.GetEnvironmentVariable("RESPONSE_MQTT_TOPIC")
                     ?? Environment.GetEnvironmentVariable("RESPONSE_TOPIC");
 
+                // The AIO Event Hubs(AMQP) -> Kafka -> MQTT v5 translation drops/mangles BINARY Kafka user
+                // headers, so raw Correlation Data bytes never reach the commander (only the text headers
+                // survive) and the RPC request is silently ignored. Send the correlation id as a UTF-8 TEXT
+                // header (a GUID string) so it survives the round-trip; use the same text bytes for matching
+                // the echoed response in HandleAioResponse.
+                correlationData = Encoding.UTF8.GetBytes(new Guid(correlationData).ToString());
+
                 Headers headers = new()
                 {
                     { "Correlation Data", correlationData },
