@@ -1,6 +1,7 @@
 ﻿
 namespace UACloudAction
 {
+    using Azure.Identity;
     using Confluent.Kafka;
     using Kusto.Data;
     using Kusto.Data.Common;
@@ -126,11 +127,24 @@ namespace UACloudAction
                     string? uaServerApplicationName = Environment.GetEnvironmentVariable("UA_SERVER_APPLICATION_NAME");
                     string? uaServerLocationName = Environment.GetEnvironmentVariable("UA_SERVER_LOCATION_NAME");
 
+                    // When running on the edge (Arc-enabled Kubernetes) with Microsoft Entra Workload Identity,
+                    // the mutating webhook projects a federated token and sets AZURE_FEDERATED_TOKEN_FILE. In that
+                    // case authenticate to ADX with a token credential (no secret) rather than an app key/MI id.
+                    bool useWorkloadIdentity = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE"));
+
                     // acquire access to ADX token Kusto SDK
-                    if (!string.IsNullOrEmpty(adxInstanceURL) && !string.IsNullOrEmpty(adxDatabaseName) && !string.IsNullOrEmpty(applicationClientId))
+                    if (!string.IsNullOrEmpty(adxInstanceURL) && !string.IsNullOrEmpty(adxDatabaseName)
+                        && (useWorkloadIdentity || !string.IsNullOrEmpty(applicationClientId)))
                     {
                         KustoConnectionStringBuilder connectionString;
-                        if (!string.IsNullOrEmpty(applicationKey) && !string.IsNullOrEmpty(tenantId))
+                        if (useWorkloadIdentity)
+                        {
+                            // DefaultAzureCredential resolves WorkloadIdentityCredential in-cluster (via the
+                            // projected federated token), falling back to managed identity / other sources.
+                            connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName)
+                                .WithAadAzureTokenCredentialsAuthentication(new DefaultAzureCredential());
+                        }
+                        else if (!string.IsNullOrEmpty(applicationKey) && !string.IsNullOrEmpty(tenantId))
                         {
                             connectionString = new KustoConnectionStringBuilder(adxInstanceURL.Replace("https://", string.Empty), adxDatabaseName).WithAadApplicationKeyAuthentication(applicationClientId, applicationKey, tenantId);
                         }

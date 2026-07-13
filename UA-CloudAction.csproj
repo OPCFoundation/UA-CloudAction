@@ -12,6 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
     <PackageReference Include="Confluent.Kafka" Version="2.15.0" />
     <PackageReference Include="Microsoft.Azure.Kusto.Data" Version="14.2.0" />
     <PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.23.0" />
