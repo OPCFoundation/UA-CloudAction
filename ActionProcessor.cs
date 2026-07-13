@@ -170,11 +170,11 @@ namespace UACloudAction
                         ActionNetworkMessage request = BuildActionRequest(out byte[] correlationData);
                         string requestJson = JsonSerializer.Serialize(request, _jsonOptions);
 
-                        // select the transport used to reach UA Cloud Commander: "MQTT" (or "AIO") targets a
-                        // Commander running in Azure IoT Operations, "Kafka" (default) uses Azure Event Hubs
+                        // select the transport used to reach the OPC UA method: "MQTT" publishes the request
+                        // directly to the local Azure IoT Operations (AIO) MQTT broker (UA-CloudAction runs on the
+                        // edge, inside the K3s cluster). "Kafka" (default) uses Azure Event Hubs / UA Cloud Commander.
                         string platform = Environment.GetEnvironmentVariable("MESSAGING_PLATFORM") ?? "Kafka";
-                        if (platform.Equals("MQTT", StringComparison.OrdinalIgnoreCase)
-                         || platform.Equals("AIO", StringComparison.OrdinalIgnoreCase))
+                        if (platform.Equals("MQTT", StringComparison.OrdinalIgnoreCase))
                         {
                             SendRequestViaMqtt(requestJson, correlationData);
                         }
@@ -332,8 +332,9 @@ namespace UACloudAction
 
         private void SendRequestViaMqtt(string requestJson, byte[] correlationData)
         {
-            // Azure IoT Operations (AIO) uses an MQTT broker as its messaging backbone. When UA Cloud Commander
-            // runs in AIO it subscribes to TOPIC and publishes the correlated ActionResponse to RESPONSE_TOPIC.
+            // UA-CloudAction runs on the edge (inside the K3s cluster where Azure IoT Operations runs) and publishes
+            // the OPC UA method call directly to the local AIO MQTT broker. The built-in OPC UA connector commander
+            // subscribes to TOPIC (its MQTT-RPC action topic) and publishes the correlated response to RESPONSE_TOPIC.
             string brokerName = Environment.GetEnvironmentVariable("BROKER_NAME") ?? "aio-broker";
             int port = int.TryParse(Environment.GetEnvironmentVariable("MQTT_PORT"), out int parsedPort) ? parsedPort : 8883;
             string? topic = Environment.GetEnvironmentVariable("TOPIC");
@@ -416,14 +417,34 @@ namespace UACloudAction
 
             using ManualResetEventSlim responseReceived = new(false);
 
+            // Determined again below; captured here so the receive handler knows how to interpret the response.
+            bool aioCommanderResponse = (Environment.GetEnvironmentVariable("MQTT_TARGET") ?? "AIOCommander")
+                .Equals("AIOCommander", StringComparison.OrdinalIgnoreCase);
+
             client.ApplicationMessageReceivedAsync += args =>
             {
                 try
                 {
-                    string responseJson = Encoding.UTF8.GetString(args.ApplicationMessage.Payload.ToArray());
-                    if (HandleResponse(responseJson, correlationData))
+                    if (aioCommanderResponse)
                     {
-                        responseReceived.Set();
+                        // The AIO commander echoes the MQTT v5 Correlation Data and returns the raw method result as
+                        // the body (not an ActionNetworkMessage envelope), so correlate on the transport property.
+                        byte[]? responseCorrelation = args.ApplicationMessage.CorrelationData;
+                        if ((responseCorrelation != null) && responseCorrelation.SequenceEqual(correlationData))
+                        {
+                            ConnectionToUACloudCommander = true;
+                            string resultJson = Encoding.UTF8.GetString(args.ApplicationMessage.Payload.ToArray());
+                            Console.WriteLine($"Command successfully executed! Result: {resultJson}");
+                            responseReceived.Set();
+                        }
+                    }
+                    else
+                    {
+                        string responseJson = Encoding.UTF8.GetString(args.ApplicationMessage.Payload.ToArray());
+                        if (HandleResponse(responseJson, correlationData))
+                        {
+                            responseReceived.Set();
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -443,10 +464,22 @@ namespace UACloudAction
                     client.SubscribeAsync(responseTopic, MqttQualityOfServiceLevel.AtLeastOnce).GetAwaiter().GetResult();
                 }
 
+                // The AIO OPC UA connector commander's action topic is an MQTT v5 RPC endpoint. A valid request must
+                // carry, in addition to Correlation Data + Response Topic, the Payload Format Indicator (1 for the
+                // JSON/character body) and a Message Expiry, and the body must be the method-arguments object - for the
+                // parameter-less pressure-relief method that is an empty object "{}" (NOT the ActionRequest envelope).
+                // Set MQTT_TARGET=UACloudCommander to instead send the full envelope to a real UA Cloud Commander.
+                string mqttTarget = Environment.GetEnvironmentVariable("MQTT_TARGET") ?? "AIOCommander";
+                bool aioCommander = mqttTarget.Equals("AIOCommander", StringComparison.OrdinalIgnoreCase);
+                string payloadJson = aioCommander ? "{}" : requestJson;
+                uint messageExpirySeconds = uint.TryParse(Environment.GetEnvironmentVariable("MQTT_RPC_EXPIRY_SECONDS"), out uint parsedExpiry) ? parsedExpiry : 30;
+
                 MqttApplicationMessage message = new MqttApplicationMessageBuilder()
                     .WithTopic(topic)
-                    .WithPayload(Encoding.UTF8.GetBytes(requestJson))
+                    .WithPayload(Encoding.UTF8.GetBytes(payloadJson))
                     .WithContentType("application/json")
+                    .WithPayloadFormatIndicator(MqttPayloadFormatIndicator.CharacterData)
+                    .WithMessageExpiryInterval(messageExpirySeconds)
                     .WithResponseTopic(responseTopic)
                     .WithCorrelationData(correlationData)
                     .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
@@ -456,12 +489,12 @@ namespace UACloudAction
 
                 ConnectionToBroker = true;
 
-                Console.WriteLine($"Sent ActionRequest {requestJson} to UA Cloud Commander running in Azure IoT Operations.");
+                Console.WriteLine($"Sent {(aioCommander ? "RPC command" : "ActionRequest")} {payloadJson} to the AIO OPC UA commander.");
 
                 // wait for up to 15 seconds for the correlated response
                 if (!responseReceived.Wait(TimeSpan.FromSeconds(15)))
                 {
-                    Console.WriteLine("Timeout waiting for response from UA Cloud Commander");
+                    Console.WriteLine("Timeout waiting for response from the AIO OPC UA commander");
                 }
             }
             finally
