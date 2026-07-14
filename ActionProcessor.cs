@@ -158,7 +158,10 @@ namespace UACloudAction
                     }
                     else
                     {
-                        Console.WriteLine("Environment variables not set!");
+                        Console.WriteLine("ADX connection not configured. "
+                            + $"ADX_INSTANCE_URL={(string.IsNullOrEmpty(adxInstanceURL) ? "<missing>" : adxInstanceURL)}, "
+                            + $"ADX_DB_NAME={adxDatabaseName}, "
+                            + $"auth={(useWorkloadIdentity ? "workload-identity" : (!string.IsNullOrEmpty(applicationClientId) ? "app/mi" : "<none: set AZURE_FEDERATED_TOKEN_FILE via workload identity, or APPLICATION_ID>"))}.");
                     }
 
                     // call ADX REST endpoint with query
