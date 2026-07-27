@@ -34,6 +34,12 @@ Note: When running on Azure, you need to register UA-CloudAction as an app with 
 * UA_CLOUD_COMMANDER_ID - the PublisherId of the UA Cloud Commander instance acting as the Action Responder. Defaults to "UACloudCommander". Written to the PublisherId field of the outgoing `ua-action-request` NetworkMessage.
 * REQUESTOR_ID - the PublisherId identifying this application as the Action Requestor. Defaults to "UACloudAction".
 * MESSAGING_PLATFORM - the transport used to reach UA Cloud Commander. Set to "Kafka" (default) to use Azure Event Hubs, or "MQTT" (alias "AIO") to use the Azure IoT Operations MQTT broker.
+* DATA_SOURCE - selects the telemetry data source used to detect the high-pressure trigger. Set to "ADX" (default) to query Azure Data Explorer, or "InfluxDB" (alias "Influx") to query the in-cluster InfluxDB time-series store (see below).
+* AZURE_FEDERATED_TOKEN_FILE - when running on the edge (Arc-enabled Kubernetes) with Microsoft Entra Workload Identity, this file is projected by the mutating webhook. When set, ADX is accessed with a token credential (`DefaultAzureCredential`) instead of an application key, so `APPLICATION_KEY`/`AAD_TENANT_ID` are not required. Normally set automatically by the platform.
+* KAFKA_TARGET - the intended recipient of the Kafka (Event Hubs) message. Defaults to "UACloudCommander" (sends the full OPC UA PubSub ActionRequest envelope). Set to "AIOCommander" to target an Azure IoT Operations OPC UA connector commander via the AIO Kafka<->MQTTv5 header mapping.
+* RESPONSE_MQTT_TOPIC - only used when `KAFKA_TARGET=AIOCommander`. The MQTT v5 Response Topic the AIO commander replies on (the in-cluster topic forwarded by the reverse data flow to the `RESPONSE_TOPIC` Event Hub). Falls back to `RESPONSE_TOPIC` when not set.
+* MQTT_TARGET - only used when `MESSAGING_PLATFORM=MQTT`/`AIO`. Defaults to "AIOCommander" (sends the method-arguments object to an AIO OPC UA connector commander RPC endpoint). Set to "UACloudCommander" to instead send the full ActionRequest envelope to a real UA Cloud Commander.
+* MQTT_RPC_EXPIRY_SECONDS - only used when `MESSAGING_PLATFORM=MQTT`/`AIO`. The MQTT v5 Message Expiry Interval (in seconds) applied to the RPC request message. Defaults to 30.
 
 ## Calling UA Cloud Commander in Azure IoT Operations (AIO)
 
@@ -50,6 +56,19 @@ When UA-CloudAction runs as a pod inside the same Kubernetes cluster as Azure Io
 * MQTT_TLS_INSECURE - set to "true" to skip broker certificate validation (for testing only). Defaults to "false".
 
 To satisfy the in-cluster defaults, mount a projected service account token (audience `aio-internal`) at `MQTT_SAT_TOKEN_FILE` and the `azure-iot-operations-aio-ca-trust-bundle` config map at `MQTT_CA_FILE` in the UA-CloudAction pod spec.
+
+## Using InfluxDB as the Telemetry Data Source
+
+Set `DATA_SOURCE` to `InfluxDB` (or `Influx`) to query an InfluxDB (Flux) time-series store for the latest value of the configured field over the configured range instead of querying Azure Data Explorer. The value is compared against a threshold in code and, when exceeded, triggers the OPC UA PubSub Action exactly as the ADX path does. The following variables control the InfluxDB connection and query (both `INFLUX_TOKEN` and `INFLUX_FIELD` must be set for the query to run):
+
+* INFLUX_URL - the InfluxDB endpoint. Defaults to "http://influxdb.default.svc.cluster.local:8086".
+* INFLUX_TOKEN - the InfluxDB API token. Required (no default); the query is skipped when not set.
+* INFLUX_ORG - the InfluxDB organization. Defaults to "iot".
+* INFLUX_BUCKET - the InfluxDB bucket to query. Defaults to "mqtt".
+* INFLUX_MEASUREMENT - the measurement name to filter on. Defaults to "opcua_pubsub".
+* INFLUX_FIELD - the field name to read the latest value from. Required (no default); the query is skipped when not set.
+* INFLUX_RANGE - the Flux range start used for the query (e.g. "-1m"). Defaults to "-1m".
+* INFLUX_THRESHOLD - the numeric threshold above which the high-value (high-pressure) trigger fires. Defaults to 4000.0.
 
 ## Message Format
 

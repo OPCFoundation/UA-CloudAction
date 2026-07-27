@@ -3,6 +3,8 @@ namespace UACloudAction
 {
     using Azure.Identity;
     using Confluent.Kafka;
+    using InfluxDB.Client;
+    using InfluxDB.Client.Core.Flux.Domain;
     using Kusto.Data;
     using Kusto.Data.Common;
     using Kusto.Data.Net.Client;
@@ -24,11 +26,14 @@ namespace UACloudAction
 
         public bool ConnectionToADX { get; set; } = false;
 
+        public bool ConnectionToInflux { get; set; } = false;
+
         public bool ConnectionToBroker { get; set; } = false;
 
         public bool ConnectionToUACloudCommander { get; set; } = false;
 
         private ICslQueryProvider? _queryProvider = null;
+        private InfluxDBClient? _influxClient = null;
         private IProducer<Null, string>? _producer = null;
         private IConsumer<Ignore, byte[]>? _consumer = null;
 
@@ -107,6 +112,67 @@ namespace UACloudAction
             }
         }
 
+        // Queries InfluxDB (Flux) for the latest value of the configured field over the configured
+        // range and returns true when it exceeds the configured threshold (the high-pressure trigger).
+        private bool RunInfluxQuery(out string detectedValue)
+        {
+            detectedValue = string.Empty;
+
+            string url = Environment.GetEnvironmentVariable("INFLUX_URL") ?? "http://influxdb.default.svc.cluster.local:8086";
+            string? token = Environment.GetEnvironmentVariable("INFLUX_TOKEN");
+            string org = Environment.GetEnvironmentVariable("INFLUX_ORG") ?? "iot";
+            string bucket = Environment.GetEnvironmentVariable("INFLUX_BUCKET") ?? "mqtt";
+            string measurement = Environment.GetEnvironmentVariable("INFLUX_MEASUREMENT") ?? "opcua_pubsub";
+            string? field = Environment.GetEnvironmentVariable("INFLUX_FIELD");
+            string range = Environment.GetEnvironmentVariable("INFLUX_RANGE") ?? "-1m";
+            double threshold = double.TryParse(Environment.GetEnvironmentVariable("INFLUX_THRESHOLD"), out double parsedThreshold) ? parsedThreshold : 4000.0;
+
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(field))
+            {
+                Console.WriteLine("InfluxDB connection not configured. "
+                    + $"INFLUX_URL={url}, INFLUX_ORG={org}, INFLUX_BUCKET={bucket}, "
+                    + $"INFLUX_FIELD={(string.IsNullOrEmpty(field) ? "<missing>" : field)}, "
+                    + $"token={(string.IsNullOrEmpty(token) ? "<missing>" : "<set>")}.");
+                return false;
+            }
+
+            try
+            {
+                _influxClient ??= new InfluxDBClient(url, token);
+                ConnectionToInflux = true;
+
+                // Latest value of the field within the range; the threshold comparison is done in code so a
+                // non-numeric field is handled gracefully.
+                string flux = $"from(bucket: \"{bucket}\")"
+                            + $" |> range(start: {range})"
+                            + $" |> filter(fn: (r) => r._measurement == \"{measurement}\")"
+                            + $" |> filter(fn: (r) => r._field == \"{field}\")"
+                            + " |> last()";
+
+                List<FluxTable> tables = _influxClient.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
+
+                foreach (FluxTable table in tables)
+                {
+                    foreach (FluxRecord record in table.Records)
+                    {
+                        object? value = record.GetValue();
+                        if ((value != null) && double.TryParse(value.ToString(), out double numericValue) && (numericValue > threshold))
+                        {
+                            detectedValue = numericValue.ToString();
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+                ConnectionToInflux = false;
+            }
+
+            return false;
+        }
+
         public void Run()
         {
             Running = true;
@@ -127,62 +193,84 @@ namespace UACloudAction
                     string? uaServerApplicationName = Environment.GetEnvironmentVariable("UA_SERVER_APPLICATION_NAME");
                     string? uaServerLocationName = Environment.GetEnvironmentVariable("UA_SERVER_LOCATION_NAME");
 
-                    // When running on the edge (Arc-enabled Kubernetes) with Microsoft Entra Workload Identity,
-                    // the mutating webhook projects a federated token and sets AZURE_FEDERATED_TOKEN_FILE. In that
-                    // case authenticate to ADX with a token credential (no secret) rather than an app key/MI id.
-                    bool useWorkloadIdentity = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE"));
+                    // Select the telemetry data source: "InfluxDB" queries the in-cluster InfluxDB time-series
+                    // store; "ADX" (default) queries Azure Data Explorer.
+                    string dataSource = Environment.GetEnvironmentVariable("DATA_SOURCE") ?? "ADX";
+                    bool useInflux = dataSource.Equals("InfluxDB", StringComparison.OrdinalIgnoreCase)
+                        || dataSource.Equals("Influx", StringComparison.OrdinalIgnoreCase);
 
-                    // acquire access to ADX token Kusto SDK
-                    if (!string.IsNullOrEmpty(adxInstanceURL) && !string.IsNullOrEmpty(adxDatabaseName)
-                        && (useWorkloadIdentity || !string.IsNullOrEmpty(applicationClientId)))
+                    bool highValueDetected = false;
+                    string detectedValue = string.Empty;
+
+                    if (useInflux)
                     {
-                        KustoConnectionStringBuilder connectionString;
-                        if (useWorkloadIdentity)
-                        {
-                            // DefaultAzureCredential resolves WorkloadIdentityCredential in-cluster (via the
-                            // projected federated token), falling back to managed identity / other sources.
-                            connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName)
-                                .WithAadAzureTokenCredentialsAuthentication(new DefaultAzureCredential());
-                        }
-                        else if (!string.IsNullOrEmpty(applicationKey) && !string.IsNullOrEmpty(tenantId))
-                        {
-                            connectionString = new KustoConnectionStringBuilder(adxInstanceURL.Replace("https://", string.Empty), adxDatabaseName).WithAadApplicationKeyAuthentication(applicationClientId, applicationKey, tenantId);
-                        }
-                        else
-                        {
-                            connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName).WithAadUserManagedIdentity(applicationClientId);
-                        }
-
-                        _queryProvider = KustoClientFactory.CreateCslQueryProvider(connectionString);
-                        ConnectionToADX = (_queryProvider != null);
+                        highValueDetected = RunInfluxQuery(out detectedValue);
                     }
                     else
                     {
-                        Console.WriteLine("ADX connection not configured. "
-                            + $"ADX_INSTANCE_URL={(string.IsNullOrEmpty(adxInstanceURL) ? "<missing>" : adxInstanceURL)}, "
-                            + $"ADX_DB_NAME={adxDatabaseName}, "
-                            + $"auth={(useWorkloadIdentity ? "workload-identity" : (!string.IsNullOrEmpty(applicationClientId) ? "app/mi" : "<none: set AZURE_FEDERATED_TOKEN_FILE via workload identity, or APPLICATION_ID>"))}.");
+                        // When running on the edge (Arc-enabled Kubernetes) with Microsoft Entra Workload Identity,
+                        // the mutating webhook projects a federated token and sets AZURE_FEDERATED_TOKEN_FILE. In that
+                        // case authenticate to ADX with a token credential (no secret) rather than an app key/MI id.
+                        bool useWorkloadIdentity = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE"));
+
+                        // acquire access to ADX token Kusto SDK
+                        if (!string.IsNullOrEmpty(adxInstanceURL) && !string.IsNullOrEmpty(adxDatabaseName)
+                            && (useWorkloadIdentity || !string.IsNullOrEmpty(applicationClientId)))
+                        {
+                            KustoConnectionStringBuilder connectionString;
+                            if (useWorkloadIdentity)
+                            {
+                                // DefaultAzureCredential resolves WorkloadIdentityCredential in-cluster (via the
+                                // projected federated token), falling back to managed identity / other sources.
+                                connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName)
+                                    .WithAadAzureTokenCredentialsAuthentication(new DefaultAzureCredential());
+                            }
+                            else if (!string.IsNullOrEmpty(applicationKey) && !string.IsNullOrEmpty(tenantId))
+                            {
+                                connectionString = new KustoConnectionStringBuilder(adxInstanceURL.Replace("https://", string.Empty), adxDatabaseName).WithAadApplicationKeyAuthentication(applicationClientId, applicationKey, tenantId);
+                            }
+                            else
+                            {
+                                connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName).WithAadUserManagedIdentity(applicationClientId);
+                            }
+
+                            _queryProvider = KustoClientFactory.CreateCslQueryProvider(connectionString);
+                            ConnectionToADX = (_queryProvider != null);
+                        }
+                        else
+                        {
+                            Console.WriteLine("ADX connection not configured. "
+                                + $"ADX_INSTANCE_URL={(string.IsNullOrEmpty(adxInstanceURL) ? "<missing>" : adxInstanceURL)}, "
+                                + $"ADX_DB_NAME={adxDatabaseName}, "
+                                + $"auth={(useWorkloadIdentity ? "workload-identity" : (!string.IsNullOrEmpty(applicationClientId) ? "app/mi" : "<none: set AZURE_FEDERATED_TOKEN_FILE via workload identity, or APPLICATION_ID>"))}.");
+                        }
+
+                        // call ADX REST endpoint with query
+                        string query = "opcua_metadata_lkv"
+                                     + "| where DataSetName contains '" + uaServerApplicationName + "'"
+                                     + "| where DataSetName contains '" + uaServerLocationName + "'"
+                                     + "| join kind = inner(opcua_telemetry"
+                                     + "    | where Name == 'Pressure'"
+                                     + "    | where Timestamp > now() - 1m" // TimeStamp is when the data was generated in the UA server, so we take cloud ingestion time into account!"
+                                     + ") on Subject"
+                                     + "| extend NodeValue = toint(Value)"
+                                     + "| project Timestamp, NodeValue"
+                                     + "| order by Timestamp desc"
+                                     + "| where NodeValue > 4000";
+
+                        Dictionary<string, object> _values = new Dictionary<string, object>();
+                        RunADXQuery(query, _values);
+
+                        if ((_values.Count > 1) && _values.ContainsKey("NodeValue"))
+                        {
+                            highValueDetected = true;
+                            detectedValue = _values["NodeValue"].ToString() ?? string.Empty;
+                        }
                     }
 
-                    // call ADX REST endpoint with query
-                    string query = "opcua_metadata_lkv"
-                                 + "| where DataSetName contains '" + uaServerApplicationName + "'"
-                                 + "| where DataSetName contains '" + uaServerLocationName + "'"
-                                 + "| join kind = inner(opcua_telemetry"
-                                 + "    | where Name == 'Pressure'"
-                                 + "    | where Timestamp > now() - 1m" // TimeStamp is when the data was generated in the UA server, so we take cloud ingestion time into account!"
-                                 + ") on Subject"
-                                 + "| extend NodeValue = toint(Value)"
-                                 + "| project Timestamp, NodeValue"
-                                 + "| order by Timestamp desc"
-                                 + "| where NodeValue > 4000";
-
-                    Dictionary<string, object> _values = new Dictionary<string, object>();
-                    RunADXQuery(query, _values);
-
-                    if ((_values.Count > 1) && _values.ContainsKey("NodeValue"))
+                    if (highValueDetected)
                     {
-                        Console.WriteLine("High pressure detected: " + _values["NodeValue"].ToString());
+                        Console.WriteLine("High pressure detected: " + detectedValue);
 
                         ActionNetworkMessage request = BuildActionRequest(out byte[] correlationData);
                         string requestJson = JsonSerializer.Serialize(request, _jsonOptions);
@@ -224,6 +312,12 @@ namespace UACloudAction
                     if (_queryProvider != null)
                     {
                         _queryProvider.Dispose();
+                    }
+
+                    if (_influxClient != null)
+                    {
+                        _influxClient.Dispose();
+                        _influxClient = null;
                     }
                 }
             }
