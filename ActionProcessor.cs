@@ -43,7 +43,7 @@ namespace UACloudAction
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
 
-        private void RunADXQuery(string query, Dictionary<string, object> values, bool allowMultiRow = false)
+        private void ExecuteAdxQuery(string query, Dictionary<string, object> values, bool allowMultiRow = false)
         {
             ClientRequestProperties clientRequestProperties = new ClientRequestProperties()
             {
@@ -112,14 +112,55 @@ namespace UACloudAction
             }
         }
 
+        // Queries ADX for the latest 'Pressure' value of the configured UA server (matched by
+        // application/location in the metadata DataSetName) over the last minute and returns true
+        // when it exceeds the threshold (the high-pressure trigger).
+        private bool RunAdxQuery(out string detectedValue)
+        {
+            detectedValue = string.Empty;
+
+            string? uaServerApplicationName = Environment.GetEnvironmentVariable("UA_SERVER_APPLICATION_NAME");
+            string? uaServerLocationName = Environment.GetEnvironmentVariable("UA_SERVER_LOCATION_NAME");
+
+            // Acquire an ADX query provider using the shared connection factory (same
+            // configuration/auth as the OPC UA Web API data source).
+            _queryProvider = UACloudAction.Services.AdxConnectionFactory.Create();
+            ConnectionToADX = (_queryProvider != null);
+            if (_queryProvider == null)
+            {
+                return false;
+            }
+
+            string query = "opcua_metadata_lkv"
+                         + "| where DataSetName contains '" + uaServerApplicationName + "'"
+                         + "| where DataSetName contains '" + uaServerLocationName + "'"
+                         + "| join kind = inner(opcua_telemetry"
+                         + "    | where Name == 'Pressure'"
+                         + "    | where Timestamp > now() - 1m" // TimeStamp is when the data was generated in the UA server, so we take cloud ingestion time into account!"
+                         + ") on Subject"
+                         + "| extend NodeValue = toint(Value)"
+                         + "| project Timestamp, NodeValue"
+                         + "| order by Timestamp desc"
+                         + "| where NodeValue > 4000";
+
+            Dictionary<string, object> values = new Dictionary<string, object>();
+            ExecuteAdxQuery(query, values);
+
+            if ((values.Count > 1) && values.ContainsKey("NodeValue"))
+            {
+                detectedValue = values["NodeValue"].ToString() ?? string.Empty;
+                return true;
+            }
+
+            return false;
+        }
+
         // Queries InfluxDB (Flux) for the latest value of the configured field over the configured
         // range and returns true when it exceeds the configured threshold (the high-pressure trigger).
         private bool RunInfluxQuery(out string detectedValue)
         {
             detectedValue = string.Empty;
 
-            string url = Environment.GetEnvironmentVariable("INFLUX_URL") ?? "http://influxdb.default.svc.cluster.local:8086";
-            string? token = Environment.GetEnvironmentVariable("INFLUX_TOKEN");
             string org = Environment.GetEnvironmentVariable("INFLUX_ORG") ?? "iot";
             string bucket = Environment.GetEnvironmentVariable("INFLUX_BUCKET") ?? "mqtt";
             string measurement = Environment.GetEnvironmentVariable("INFLUX_MEASUREMENT") ?? "opcua_pubsub";
@@ -127,18 +168,22 @@ namespace UACloudAction
             string range = Environment.GetEnvironmentVariable("INFLUX_RANGE") ?? "-1m";
             double threshold = double.TryParse(Environment.GetEnvironmentVariable("INFLUX_THRESHOLD"), out double parsedThreshold) ? parsedThreshold : 4000.0;
 
-            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(field))
+            if (string.IsNullOrEmpty(field))
             {
-                Console.WriteLine("InfluxDB connection not configured. "
-                    + $"INFLUX_URL={url}, INFLUX_ORG={org}, INFLUX_BUCKET={bucket}, "
-                    + $"INFLUX_FIELD={(string.IsNullOrEmpty(field) ? "<missing>" : field)}, "
-                    + $"token={(string.IsNullOrEmpty(token) ? "<missing>" : "<set>")}.");
+                Console.WriteLine("InfluxDB query not configured (INFLUX_FIELD missing).");
                 return false;
             }
 
             try
             {
-                _influxClient ??= new InfluxDBClient(url, token);
+                // Acquire an InfluxDB client using the shared connection factory (same configuration
+                // as the OPC UA Web API data source).
+                _influxClient ??= UACloudAction.Services.InfluxConnectionFactory.Create();
+                if (_influxClient == null)
+                {
+                    return false;
+                }
+
                 ConnectionToInflux = true;
 
                 // Latest value of the field within the range; the threshold comparison is done in code so a
@@ -184,15 +229,6 @@ namespace UACloudAction
 
                 try
                 {
-                    string? applicationClientId = Environment.GetEnvironmentVariable("APPLICATION_ID");
-                    string? applicationKey = Environment.GetEnvironmentVariable("APPLICATION_KEY");
-                    string? adxInstanceURL = Environment.GetEnvironmentVariable("ADX_INSTANCE_URL");
-                    string? adxDatabaseName = Environment.GetEnvironmentVariable("ADX_DB_NAME");
-                    string? adxTableName = Environment.GetEnvironmentVariable("ADX_TABLE_NAME");
-                    string? tenantId = Environment.GetEnvironmentVariable("AAD_TENANT_ID");
-                    string? uaServerApplicationName = Environment.GetEnvironmentVariable("UA_SERVER_APPLICATION_NAME");
-                    string? uaServerLocationName = Environment.GetEnvironmentVariable("UA_SERVER_LOCATION_NAME");
-
                     // Select the telemetry data source: "InfluxDB" queries the in-cluster InfluxDB time-series
                     // store; "ADX" (default) queries Azure Data Explorer.
                     string dataSource = Environment.GetEnvironmentVariable("DATA_SOURCE") ?? "ADX";
@@ -208,64 +244,7 @@ namespace UACloudAction
                     }
                     else
                     {
-                        // When running on the edge (Arc-enabled Kubernetes) with Microsoft Entra Workload Identity,
-                        // the mutating webhook projects a federated token and sets AZURE_FEDERATED_TOKEN_FILE. In that
-                        // case authenticate to ADX with a token credential (no secret) rather than an app key/MI id.
-                        bool useWorkloadIdentity = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE"));
-
-                        // acquire access to ADX token Kusto SDK
-                        if (!string.IsNullOrEmpty(adxInstanceURL) && !string.IsNullOrEmpty(adxDatabaseName)
-                            && (useWorkloadIdentity || !string.IsNullOrEmpty(applicationClientId)))
-                        {
-                            KustoConnectionStringBuilder connectionString;
-                            if (useWorkloadIdentity)
-                            {
-                                // DefaultAzureCredential resolves WorkloadIdentityCredential in-cluster (via the
-                                // projected federated token), falling back to managed identity / other sources.
-                                connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName)
-                                    .WithAadAzureTokenCredentialsAuthentication(new DefaultAzureCredential());
-                            }
-                            else if (!string.IsNullOrEmpty(applicationKey) && !string.IsNullOrEmpty(tenantId))
-                            {
-                                connectionString = new KustoConnectionStringBuilder(adxInstanceURL.Replace("https://", string.Empty), adxDatabaseName).WithAadApplicationKeyAuthentication(applicationClientId, applicationKey, tenantId);
-                            }
-                            else
-                            {
-                                connectionString = new KustoConnectionStringBuilder(adxInstanceURL, adxDatabaseName).WithAadUserManagedIdentity(applicationClientId);
-                            }
-
-                            _queryProvider = KustoClientFactory.CreateCslQueryProvider(connectionString);
-                            ConnectionToADX = (_queryProvider != null);
-                        }
-                        else
-                        {
-                            Console.WriteLine("ADX connection not configured. "
-                                + $"ADX_INSTANCE_URL={(string.IsNullOrEmpty(adxInstanceURL) ? "<missing>" : adxInstanceURL)}, "
-                                + $"ADX_DB_NAME={adxDatabaseName}, "
-                                + $"auth={(useWorkloadIdentity ? "workload-identity" : (!string.IsNullOrEmpty(applicationClientId) ? "app/mi" : "<none: set AZURE_FEDERATED_TOKEN_FILE via workload identity, or APPLICATION_ID>"))}.");
-                        }
-
-                        // call ADX REST endpoint with query
-                        string query = "opcua_metadata_lkv"
-                                     + "| where DataSetName contains '" + uaServerApplicationName + "'"
-                                     + "| where DataSetName contains '" + uaServerLocationName + "'"
-                                     + "| join kind = inner(opcua_telemetry"
-                                     + "    | where Name == 'Pressure'"
-                                     + "    | where Timestamp > now() - 1m" // TimeStamp is when the data was generated in the UA server, so we take cloud ingestion time into account!"
-                                     + ") on Subject"
-                                     + "| extend NodeValue = toint(Value)"
-                                     + "| project Timestamp, NodeValue"
-                                     + "| order by Timestamp desc"
-                                     + "| where NodeValue > 4000";
-
-                        Dictionary<string, object> _values = new Dictionary<string, object>();
-                        RunADXQuery(query, _values);
-
-                        if ((_values.Count > 1) && _values.ContainsKey("NodeValue"))
-                        {
-                            highValueDetected = true;
-                            detectedValue = _values["NodeValue"].ToString() ?? string.Empty;
-                        }
+                        highValueDetected = RunAdxQuery(out detectedValue);
                     }
 
                     if (highValueDetected)

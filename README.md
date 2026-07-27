@@ -35,11 +35,13 @@ Note: When running on Azure, you need to register UA-CloudAction as an app with 
 * REQUESTOR_ID - the PublisherId identifying this application as the Action Requestor. Defaults to "UACloudAction".
 * MESSAGING_PLATFORM - the transport used to reach UA Cloud Commander. Set to "Kafka" (default) to use Azure Event Hubs, or "MQTT" (alias "AIO") to use the Azure IoT Operations MQTT broker.
 * DATA_SOURCE - selects the telemetry data source used to detect the high-pressure trigger. Set to "ADX" (default) to query Azure Data Explorer, or "InfluxDB" (alias "Influx") to query the in-cluster InfluxDB time-series store (see below).
-* AZURE_FEDERATED_TOKEN_FILE - when running on the edge (Arc-enabled Kubernetes) with Microsoft Entra Workload Identity, this file is projected by the mutating webhook. When set, ADX is accessed with a token credential (`DefaultAzureCredential`) instead of an application key, so `APPLICATION_KEY`/`AAD_TENANT_ID` are not required. Normally set automatically by the platform.
+Note: when neither `APPLICATION_ID` (with `APPLICATION_KEY`/`AAD_TENANT_ID`) nor a user-assigned managed identity is configured, ADX access also falls back to `DefaultAzureCredential`, which locally picks up your Visual Studio sign-in, Azure CLI or Azure PowerShell credentials - convenient for local development. If the ADX cluster is in a different (non-home) tenant, set `AAD_TENANT_ID` to that cluster's tenant so the token is requested for the correct tenant.
 * KAFKA_TARGET - the intended recipient of the Kafka (Event Hubs) message. Defaults to "UACloudCommander" (sends the full OPC UA PubSub ActionRequest envelope). Set to "AIOCommander" to target an Azure IoT Operations OPC UA connector commander via the AIO Kafka<->MQTTv5 header mapping.
 * RESPONSE_MQTT_TOPIC - only used when `KAFKA_TARGET=AIOCommander`. The MQTT v5 Response Topic the AIO commander replies on (the in-cluster topic forwarded by the reverse data flow to the `RESPONSE_TOPIC` Event Hub). Falls back to `RESPONSE_TOPIC` when not set.
 * MQTT_TARGET - only used when `MESSAGING_PLATFORM=MQTT`/`AIO`. Defaults to "AIOCommander" (sends the method-arguments object to an AIO OPC UA connector commander RPC endpoint). Set to "UACloudCommander" to instead send the full ActionRequest envelope to a real UA Cloud Commander.
 * MQTT_RPC_EXPIRY_SECONDS - only used when `MESSAGING_PLATFORM=MQTT`/`AIO`. The MQTT v5 Message Expiry Interval (in seconds) applied to the RPC request message. Defaults to 30.
+* RATE_LIMIT_PERMIT - the maximum number of OPC UA Web API requests allowed per client IP within each rate-limit window. Defaults to 60.
+* RATE_LIMIT_WINDOW_SECONDS - the length (in seconds) of the fixed rate-limit window for the OPC UA Web API. Defaults to 60.
 
 ## Calling UA Cloud Commander in Azure IoT Operations (AIO)
 
@@ -69,6 +71,60 @@ Set `DATA_SOURCE` to `InfluxDB` (or `Influx`) to query an InfluxDB (Flux) time-s
 * INFLUX_FIELD - the field name to read the latest value from. Required (no default); the query is skipped when not set.
 * INFLUX_RANGE - the Flux range start used for the query (e.g. "-1m"). Defaults to "-1m".
 * INFLUX_THRESHOLD - the numeric threshold above which the high-value (high-pressure) trigger fires. Defaults to 4000.0.
+
+## OPC UA Web API (ADX and InfluxDB Data Sources)
+
+backed by the same ADX and InfluxDB data sources used to detect the trigger. Each data source has its own implementation (`AdxDataSource` and `InfluxDataSource`), selected by a resolver from the `DATA_SOURCE` environment variable. Three operations are implemented
+
+* `POST /opcua/browse` - OPC UA Browse service (OPC 10000-4, 5.9.2). Returns a flat list of the queryable tags (as expanded NodeIds) so callers can discover what `read` and `historyread` can be called with.
+* `POST /opcua/read` - OPC UA Read service (OPC 10000-4, 5.11.2). Returns the latest `DataValue` for each node in `NodesToRead`.
+* `POST /opcua/historyread` - OPC UA HistoryRead service (OPC 10000-4, 5.11.3) with `ReadRawModifiedDetails`. Returns the raw historical `DataValue`s for each node over the `StartTime`/`EndTime` range (limited by `NumValuesPerNode`).
+
+for ADX it joins `opcua_telemetry` to `opcua_metadata_lkv` on the `Subject` column and reads the metadata `DataSetName` column (which carries the namespace URI plus additional metadata - the URI-looking part is used for the NodeId and the full `DataSetName` is returned as the reference `DisplayName`); when the `DataSetName` carries no namespace URI (e.g. producers like Azure IoT Operations), the namespace is resolved from the raw metadata table `opcua_metadata_raw` (the DataSetMetaData `Namespaces` array, first non-base entry). For InfluxDB it reads the measurement's `DataSetName` tag.
+
+A NodeId returned by `browse` can be passed directly to `read` and `historyread`. Because OPC UA string identifiers are not unique across DataSets (and numeric/guid identifiers do not map to a tag name at all), these operations resolve the NodeId back to the underlying series via the metadata rather than by string matching: for ADX the NodeId is matched against `opcua_metadata_lkv.DataSetName` (exact) or against the telemetry `Name` plus effective namespace, yielding the unique `Subject` that the telemetry is then queried by; for InfluxDB the field is the string identifier and, when the NodeId carries a namespace, the `DataSetName` tag is used to disambiguate.
+
+The data source is selected from the `DATA_SOURCE` environment variable (ADX default, "InfluxDB"/"Influx" for InfluxDB); API callers do not choose it per request. The ADX and InfluxDB connections reuse the environment variables documented above (`ADX_*`, `APPLICATION_*`, `AAD_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, and `INFLUX_*`).
+
+Example - assume an OPC UA server that publishes its nodes under the namespace URI `http://opcfoundation.org/UA/myserver` and exposes a `Pressure` variable (with `DATA_SOURCE=InfluxDB` configured). Browse the available tags:
+
+```
+POST /opcua/browse
+Content-Type: application/json
+
+{}
+```
+
+Read the latest value of that `Pressure` tag:
+
+```
+POST /opcua/read
+Content-Type: application/json
+
+{ "NodesToRead": [ { "NodeId": "nsu=http://opcfoundation.org/UA/myserver;s=Pressure" } ] }
+```
+
+Example - read the last hour of raw history from ADX:
+
+```
+POST /opcua/historyread
+Content-Type: application/json
+
+{
+  "HistoryReadDetails": {
+    "StartTime": "2024-01-01T00:00:00Z",
+    "EndTime": "2024-01-01T01:00:00Z",
+    "NumValuesPerNode": 100
+  },
+  "NodesToRead": [ { "NodeId": "nsu=http://opcfoundation.org/UA/myserver;s=Pressure" } ]
+}
+```
+
+> Note: these endpoints require HTTP Basic authentication using the same `ADMIN_USERNAME`/`ADMIN_PASSWORD` credentials as the interactive login. Send an `Authorization: Basic <base64(username:password)>` header with each request; unauthenticated requests receive `401 Unauthorized` with a `WWW-Authenticate: Basic` challenge.
+
+> Note: the endpoints are rate limited per client IP using a fixed window. The limit and window are configurable via the `RATE_LIMIT_PERMIT` and `RATE_LIMIT_WINDOW_SECONDS` environment variables (defaulting to 60 requests per 60 seconds). Requests exceeding the limit receive `429 Too Many Requests`.
+
+An interactive **Swagger UI** is available at `/swagger`. Use its **Authorize** button to supply the `ADMIN_USERNAME`/`ADMIN_PASSWORD` Basic credentials before invoking the `/opcua/read` and `/opcua/historyread` operations.
 
 ## Message Format
 
