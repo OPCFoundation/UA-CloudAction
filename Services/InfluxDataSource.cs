@@ -65,13 +65,14 @@ namespace UACloudAction.Services
             // its "metaName" tag.
             Dictionary<string, string> namespaceByWriter = GetNamespaceByWriter(client, org, bucket, metadataMeasurement);
 
-            // Field keys alone do not tell us which writer produced them, so read the
-            // distinct (datasetWriterId, _field) pairs from the telemetry itself.
+            // Distinct (datasetWriterId, _field) pairs. Grouping by both columns keeps
+            // datasetWriterId in the group key so it survives into each record; a bare
+            // group()/distinct() would drop it and lose the writer association.
             string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
                 + " |> range(start: -30d)"
                 + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(measurement)}\")"
                 + " |> keep(columns: [\"datasetWriterId\", \"_field\"])"
-                + " |> group()"
+                + " |> group(columns: [\"datasetWriterId\", \"_field\"])"
                 + " |> distinct(column: \"_field\")";
 
             List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
@@ -81,7 +82,7 @@ namespace UACloudAction.Services
                 foreach (FluxRecord record in table.Records)
                 {
                     string? value = record.GetValue()?.ToString();
-                    if (string.IsNullOrEmpty(value) || !seen.Add(value))
+                    if (string.IsNullOrEmpty(value))
                     {
                         continue;
                     }
@@ -91,7 +92,18 @@ namespace UACloudAction.Services
                         ? dsn
                         : null;
 
-                    tags.Add(new OpcUaBrowseTag(value, OpcUaNodeId.NamespaceUriFromDataSetName(dataSetName), dataSetName));
+                    // Stations publish under a shared namespace URI and are distinguished
+                    // only by the ApplicationUri, so de-duplicate on (application, field).
+                    // De-duplicating on the field alone would collapse all four stations
+                    // into a single entry.
+                    string? namespaceUri = OpcUaNodeId.NamespaceUriFromDataSetName(dataSetName);
+                    string? applicationUri = OpcUaNodeId.ApplicationUriFromDataSetName(dataSetName);
+                    if (!seen.Add($"{applicationUri}|{namespaceUri}|{value}"))
+                    {
+                        continue;
+                    }
+
+                    tags.Add(new OpcUaBrowseTag(value, namespaceUri, dataSetName));
                 }
             }
 

@@ -173,9 +173,53 @@ namespace UACloudAction.Services
                 return null;
             }
 
-            foreach (string segment in value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            string[] segments = value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            // Prefer an explicit "nsu=<uri>" component. The InfluxDB metadata stores the
+            // DataSetName as a full ExpandedNodeId, e.g.
+            // "urn:<applicationUri>;nsu=<namespaceUri>;s=<identifier>", where the leading
+            // urn: segment is the ApplicationUri rather than the namespace.
+            foreach (string segment in segments)
+            {
+                if (segment.StartsWith("nsu=", StringComparison.OrdinalIgnoreCase))
+                {
+                    string uri = segment.Substring(4).Trim();
+                    if (!string.IsNullOrEmpty(uri))
+                    {
+                        return uri;
+                    }
+                }
+            }
+
+            foreach (string segment in segments)
             {
                 if (LooksLikeUri(segment))
+                {
+                    return segment;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Extracts the ApplicationUri from a metadata DataSetName value, i.e. the leading
+        /// <c>urn:</c> component of an ExpandedNodeId such as
+        /// <c>urn:&lt;applicationUri&gt;;nsu=&lt;namespaceUri&gt;;s=&lt;identifier&gt;</c>. This is what
+        /// distinguishes individual servers (e.g. production line stations) that publish under a
+        /// shared namespace URI. Returns <c>null</c> when no such component is present.
+        /// </summary>
+        public static string? ApplicationUriFromDataSetName(string? dataSetName)
+        {
+            string? value = FirstNamespaceUri(dataSetName);
+            if (string.IsNullOrEmpty(value))
+            {
+                return null;
+            }
+
+            foreach (string segment in value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (segment.StartsWith("urn:", StringComparison.OrdinalIgnoreCase))
                 {
                     return segment;
                 }
