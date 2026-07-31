@@ -28,7 +28,6 @@
         "ADMIN_PASSWORD": "myPassword",
         "ADX_INSTANCE_URL": "https://sandbox53adx.northeurope.kusto.windows.net",
         "ADX_DB_NAME": "ontologies",
-        "ADX_TABLE_NAME": "opcua_telemetry",
         "AAD_TENANT_ID": "2d8ef4e4-d41c-489c-8004-bb99304b60fe",
         "APPLICATION_ID": "",
         "APPLICATION_KEY": "",

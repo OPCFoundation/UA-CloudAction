@@ -14,7 +14,6 @@ Note: When running on Azure, you need to register UA-CloudAction as an app with 
 * ADMIN_PASSWORD - the password for the username
 * ADX_INSTANCE_URL - the endpoint of your ADX cluster, e.g. https://ontologies.eastus2.kusto.windows.net/
 * ADX_DB_NAME - the name of your ADX database
-* ADX_TABLE_NAME - the name of your ADX table
 * AAD_TENANT_ID - the GUID of your AAD tenant of your Azure subscription
 * APPLICATION_KEY - the secret you created during UA-Cloud Action app registration
 * APPLICATION_ID - the GUID assigned to the UA-Cloud Action during app registration
@@ -35,7 +34,7 @@ Note: When running on Azure, you need to register UA-CloudAction as an app with 
 * REQUESTOR_ID - the PublisherId identifying this application as the Action Requestor. Defaults to "UACloudAction".
 * MESSAGING_PLATFORM - the transport used to reach UA Cloud Commander. Set to "Kafka" (default) to use Azure Event Hubs, or "MQTT" (alias "AIO") to use the Azure IoT Operations MQTT broker.
 * DATA_SOURCE - selects the telemetry data source used to detect the high-pressure trigger. Set to "ADX" (default) to query Azure Data Explorer, or "InfluxDB" (alias "Influx") to query the in-cluster InfluxDB time-series store (see below).
-Note: when neither `APPLICATION_ID` (with `APPLICATION_KEY`/`AAD_TENANT_ID`) nor a user-assigned managed identity is configured, ADX access also falls back to `DefaultAzureCredential`, which locally picks up your Visual Studio sign-in, Azure CLI or Azure PowerShell credentials - convenient for local development. If the ADX cluster is in a different (non-home) tenant, set `AAD_TENANT_ID` to that cluster's tenant so the token is requested for the correct tenant.
+* AZURE_FEDERATED_TOKEN_FILE - when running on the edge (Arc-enabled Kubernetes) with Microsoft Entra Workload Identity, this file is projected by the mutating webhook. When set, ADX is accessed with a token credential (`DefaultAzureCredential`) instead of an application key, so `APPLICATION_KEY`/`AAD_TENANT_ID` are not required. Normally set automatically by the platform. Note: when neither `APPLICATION_ID` (with `APPLICATION_KEY`/`AAD_TENANT_ID`) nor a user-assigned managed identity is configured, ADX access also falls back to `DefaultAzureCredential`, which locally picks up your Visual Studio sign-in, Azure CLI or Azure PowerShell credentials - convenient for local development. If the ADX cluster is in a different (non-home) tenant, set `AAD_TENANT_ID` to that cluster's tenant so the token is requested for the correct tenant.
 * KAFKA_TARGET - the intended recipient of the Kafka (Event Hubs) message. Defaults to "UACloudCommander" (sends the full OPC UA PubSub ActionRequest envelope). Set to "AIOCommander" to target an Azure IoT Operations OPC UA connector commander via the AIO Kafka<->MQTTv5 header mapping.
 * RESPONSE_MQTT_TOPIC - only used when `KAFKA_TARGET=AIOCommander`. The MQTT v5 Response Topic the AIO commander replies on (the in-cluster topic forwarded by the reverse data flow to the `RESPONSE_TOPIC` Event Hub). Falls back to `RESPONSE_TOPIC` when not set.
 * MQTT_TARGET - only used when `MESSAGING_PLATFORM=MQTT`/`AIO`. Defaults to "AIOCommander" (sends the method-arguments object to an AIO OPC UA connector commander RPC endpoint). Set to "UACloudCommander" to instead send the full ActionRequest envelope to a real UA Cloud Commander.
@@ -68,6 +67,7 @@ Set `DATA_SOURCE` to `InfluxDB` (or `Influx`) to query an InfluxDB (Flux) time-s
 * INFLUX_ORG - the InfluxDB organization. Defaults to "iot".
 * INFLUX_BUCKET - the InfluxDB bucket to query. Defaults to "mqtt".
 * INFLUX_MEASUREMENT - the measurement name to filter on. Defaults to "opcua_pubsub".
+* INFLUX_METADATA_MEASUREMENT - the measurement holding the OPC UA metadata used by the Web API `browse` operation (it shares the `datasetWriterId` tag with the telemetry and carries the DataSetName in its `metaName` tag). Defaults to "opcua_metadata".
 * INFLUX_FIELD - the field name to read the latest value from. Required (no default); the query is skipped when not set.
 * INFLUX_RANGE - the Flux range start used for the query (e.g. "-1m"). Defaults to "-1m".
 * INFLUX_THRESHOLD - the numeric threshold above which the high-value (high-pressure) trigger fires. Defaults to 4000.0.
