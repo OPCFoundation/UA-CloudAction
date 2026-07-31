@@ -56,65 +56,91 @@ namespace UACloudAction.Services
             string org = Environment.GetEnvironmentVariable("INFLUX_ORG") ?? "iot";
             string bucket = Environment.GetEnvironmentVariable("INFLUX_BUCKET") ?? "mqtt";
             string measurement = Environment.GetEnvironmentVariable("INFLUX_MEASUREMENT") ?? "opcua_pubsub";
+            string metadataMeasurement = Environment.GetEnvironmentVariable("INFLUX_METADATA_MEASUREMENT") ?? "opcua_metadata";
 
-            // The OPC UA metadata (namespace URI plus additional metadata) is recorded once as the
-            // "DataSetName" tag on the measurement's points; the namespace URI is derived from it,
-            // mirroring the ADX path (opcua_metadata_lkv.DataSetName).
-            string? dataSetName = GetDataSetName();
-            string? namespaceUri = OpcUaNodeId.NamespaceUriFromDataSetName(dataSetName);
+            // Namespace URI per dataset writer. This mirrors the ADX path, which joins
+            // opcua_telemetry to opcua_metadata_lkv on Subject: here the telemetry
+            // (measurement) and the metadata (metadataMeasurement) share the
+            // "datasetWriterId" tag, and the metadata carries the OPC UA DataSetName in
+            // its "metaName" tag.
+            Dictionary<string, string> namespaceByWriter = GetNamespaceByWriter(client, org, bucket, metadataMeasurement);
 
-            // The field keys of the measurement are the queryable tags.
-            string flux = "import \"influxdata/influxdb/schema\"\n"
-                + $"schema.measurementFieldKeys(bucket: \"{bucket}\", measurement: \"{measurement}\")";
+            // Field keys alone do not tell us which writer produced them, so read the
+            // distinct (datasetWriterId, _field) pairs from the telemetry itself.
+            string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
+                + " |> range(start: -30d)"
+                + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(measurement)}\")"
+                + " |> keep(columns: [\"datasetWriterId\", \"_field\"])"
+                + " |> group()"
+                + " |> distinct(column: \"_field\")";
 
             List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
+            HashSet<string> seen = new(StringComparer.Ordinal);
             foreach (FluxTable table in tables)
             {
                 foreach (FluxRecord record in table.Records)
                 {
                     string? value = record.GetValue()?.ToString();
-                    if (!string.IsNullOrEmpty(value))
+                    if (string.IsNullOrEmpty(value) || !seen.Add(value))
                     {
-                        tags.Add(new OpcUaBrowseTag(value, namespaceUri, dataSetName));
+                        continue;
                     }
+
+                    string? writer = record.GetValueByKey("datasetWriterId")?.ToString();
+                    string? dataSetName = writer != null && namespaceByWriter.TryGetValue(writer, out string? dsn)
+                        ? dsn
+                        : null;
+
+                    tags.Add(new OpcUaBrowseTag(value, OpcUaNodeId.NamespaceUriFromDataSetName(dataSetName), dataSetName));
                 }
             }
 
             return tags;
         }
 
-        private string? GetDataSetName()
+        /// <summary>
+        /// Maps each datasetWriterId to the DataSetName recorded for it in the metadata
+        /// measurement. The OPC UA namespace URI is embedded in that value.
+        /// </summary>
+        private Dictionary<string, string> GetNamespaceByWriter(InfluxDBClient client, string org, string bucket, string metadataMeasurement)
         {
-            InfluxDBClient? client = GetClient();
-            if (client == null)
+            Dictionary<string, string> result = new(StringComparer.Ordinal);
+
+            // metaName holds "<ApplicationUri>;<NodeId>" (the DataSetName). Filtering to a
+            // single field (cfgMajor) and taking last() per writer yields exactly one current
+            // row per writer, which is the Flux equivalent of the ADX opcua_metadata_lkv
+            // ("last known value") materialized view. This matches the metadata join used by
+            // the InfluxDB tutorial and the Grafana dashboards.
+            string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
+                + " |> range(start: -30d)"
+                + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(metadataMeasurement)}\" and r._field == \"cfgMajor\")"
+                + " |> group(columns: [\"datasetWriterId\"])"
+                + " |> last()"
+                + " |> keep(columns: [\"datasetWriterId\", \"metaName\"])";
+
+            try
             {
-                return null;
-            }
-
-            string org = Environment.GetEnvironmentVariable("INFLUX_ORG") ?? "iot";
-            string bucket = Environment.GetEnvironmentVariable("INFLUX_BUCKET") ?? "mqtt";
-            string measurement = Environment.GetEnvironmentVariable("INFLUX_MEASUREMENT") ?? "opcua_pubsub";
-
-            // The OPC UA DataSetName (namespace URI plus additional metadata) is recorded as the
-            // "DataSetName" tag on the measurement's points.
-            string flux = "import \"influxdata/influxdb/schema\"\n"
-                + $"schema.tagValues(bucket: \"{bucket}\", tag: \"DataSetName\", "
-                + $"predicate: (r) => r._measurement == \"{measurement}\")";
-
-            List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
-            foreach (FluxTable table in tables)
-            {
-                foreach (FluxRecord record in table.Records)
+                List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
+                foreach (FluxTable table in tables)
                 {
-                    string? value = record.GetValue()?.ToString();
-                    if (!string.IsNullOrEmpty(value))
+                    foreach (FluxRecord record in table.Records)
                     {
-                        return value;
+                        string? writer = record.GetValueByKey("datasetWriterId")?.ToString();
+                        string? metaName = record.GetValueByKey("metaName")?.ToString();
+                        if (!string.IsNullOrEmpty(writer) && !string.IsNullOrEmpty(metaName))
+                        {
+                            result[writer] = metaName;
+                        }
                     }
                 }
             }
+            catch (Exception)
+            {
+                // Metadata is optional: without it the browse result simply carries no
+                // namespace URI, which is preferable to failing the whole request.
+            }
 
-            return null;
+            return result;
         }
 
         private List<DataValue> Query(string nodeId, string tail, string? rangeStart = null, string? rangeStop = null)
@@ -130,39 +156,45 @@ namespace UACloudAction.Services
             string org = Environment.GetEnvironmentVariable("INFLUX_ORG") ?? "iot";
             string bucket = Environment.GetEnvironmentVariable("INFLUX_BUCKET") ?? "mqtt";
             string measurement = Environment.GetEnvironmentVariable("INFLUX_MEASUREMENT") ?? "opcua_pubsub";
+            string metadataMeasurement = Environment.GetEnvironmentVariable("INFLUX_METADATA_MEASUREMENT") ?? "opcua_metadata";
 
-            // Resolve the NodeId to its InfluxDB series. String identifiers (the _field) are not unique
-            // across DataSets, and each point carries both a "DataSetName" and a "Subject" tag (the
-            // Subject is the unique series key). So we key off the DataSetName (which pins the Subject)
-            // exactly when the NodeId is a full node id, mirroring the ADX (Subject, Name) resolution;
-            // for the constructed "nsu=<ns>;s=<tag>" form we fall back to the _field plus a namespace
-            // match on the DataSetName.
+            // Resolve the NodeId to its InfluxDB series. The telemetry measurement is keyed by
+            // (datasetWriterId, _field); the DataSetName that identifies a node lives in the
+            // metadata measurement's "metaName" tag, linked by datasetWriterId. This mirrors the
+            // ADX (Subject, Name) resolution, where Subject == datasetWriterId and the metadata
+            // lookup supplies the DataSetName.
             string field = OpcUaNodeId.ParseStringIdentifier(nodeId);
             string? parsedNs = OpcUaNodeId.NamespaceFromNodeId(nodeId);
             bool syntheticNodeId = nodeId.StartsWith("nsu=", StringComparison.OrdinalIgnoreCase);
 
-            string imports = string.Empty;
             string keyFilter;
             if (syntheticNodeId)
             {
-                // Constructed nsu=<ns>;s=<tag> form: match the field and (when present) the namespace
-                // contained in the DataSetName / Subject.
+                // Constructed nsu=<ns>;s=<tag> form: match the field, and narrow to the writers
+                // whose metadata carries that namespace when one was supplied.
+                keyFilter = $" |> filter(fn: (r) => r._field == \"{EscapeFlux(field)}\")";
+
                 if (!string.IsNullOrEmpty(parsedNs))
                 {
-                    imports = "import \"strings\"\n";
-                    keyFilter = $" |> filter(fn: (r) => r._field == \"{EscapeFlux(field)}\""
-                        + $" and exists r.DataSetName and strings.containsStr(v: r.DataSetName, substr: \"{EscapeFlux(parsedNs)}\"))";
-                }
-                else
-                {
-                    keyFilter = $" |> filter(fn: (r) => r._field == \"{EscapeFlux(field)}\")";
+                    List<string> writers = GetWritersForNamespace(client, org, bucket, metadataMeasurement, parsedNs!);
+                    if (writers.Count > 0)
+                    {
+                        string set = string.Join(", ", writers.Select(w => $"\"{EscapeFlux(w)}\""));
+                        keyFilter += $" |> filter(fn: (r) => contains(value: r.datasetWriterId, set: [{set}]))";
+                    }
                 }
             }
             else
             {
-                // Full node id: key off the exact DataSetName (which pins the Subject). Numeric/guid
-                // identifiers have no usable field, so the DataSetName match alone selects the series.
-                keyFilter = $" |> filter(fn: (r) => exists r.DataSetName and r.DataSetName == \"{EscapeFlux(nodeId)}\")";
+                // Full node id: find the writers whose DataSetName matches it exactly.
+                List<string> writers = GetWritersForDataSetName(client, org, bucket, metadataMeasurement, nodeId);
+                if (writers.Count == 0)
+                {
+                    return results;
+                }
+
+                string set = string.Join(", ", writers.Select(w => $"\"{EscapeFlux(w)}\""));
+                keyFilter = $" |> filter(fn: (r) => contains(value: r.datasetWriterId, set: [{set}]))";
             }
 
             rangeStart ??= "0";
@@ -170,10 +202,9 @@ namespace UACloudAction.Services
                 ? $"|> range(start: {rangeStart}, stop: {rangeStop})"
                 : $"|> range(start: {rangeStart})";
 
-            string flux = imports
-                + $"from(bucket: \"{bucket}\")"
+            string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
                 + $" {range}"
-                + $" |> filter(fn: (r) => r._measurement == \"{measurement}\")"
+                + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(measurement)}\")"
                 + keyFilter
                 + $" {tail}";
 
@@ -192,6 +223,62 @@ namespace UACloudAction.Services
             }
 
             return results;
+        }
+
+        /// <summary>
+        /// Returns the datasetWriterIds whose metadata DataSetName contains the given namespace URI.
+        /// </summary>
+        private List<string> GetWritersForNamespace(InfluxDBClient client, string org, string bucket, string metadataMeasurement, string namespaceUri)
+        {
+            return GetWriters(client, org, bucket, metadataMeasurement,
+                $" |> filter(fn: (r) => strings.containsStr(v: r.metaName, substr: \"{EscapeFlux(namespaceUri)}\"))",
+                needsStrings: true);
+        }
+
+        /// <summary>
+        /// Returns the datasetWriterIds whose metadata DataSetName equals the given node id exactly.
+        /// </summary>
+        private List<string> GetWritersForDataSetName(InfluxDBClient client, string org, string bucket, string metadataMeasurement, string dataSetName)
+        {
+            return GetWriters(client, org, bucket, metadataMeasurement,
+                $" |> filter(fn: (r) => r.metaName == \"{EscapeFlux(dataSetName)}\")",
+                needsStrings: false);
+        }
+
+        private List<string> GetWriters(InfluxDBClient client, string org, string bucket, string metadataMeasurement, string metaFilter, bool needsStrings)
+        {
+            List<string> writers = new();
+
+            string flux = (needsStrings ? "import \"strings\"\n" : string.Empty)
+                + $"from(bucket: \"{EscapeFlux(bucket)}\")"
+                + " |> range(start: -30d)"
+                + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(metadataMeasurement)}\")"
+                + metaFilter
+                + " |> keep(columns: [\"datasetWriterId\"])"
+                + " |> group()"
+                + " |> distinct(column: \"datasetWriterId\")";
+
+            try
+            {
+                List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
+                foreach (FluxTable table in tables)
+                {
+                    foreach (FluxRecord record in table.Records)
+                    {
+                        string? value = record.GetValue()?.ToString();
+                        if (!string.IsNullOrEmpty(value))
+                        {
+                            writers.Add(value);
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Treated as "no match": the caller falls back to a field-only filter.
+            }
+
+            return writers;
         }
 
         private static string EscapeFlux(string value)
