@@ -12,11 +12,22 @@ namespace UACloudAction.Services
         private readonly AdxDataSource _adx;
         private readonly InfluxDataSource _influx;
 
+        // Browse enumerates the whole tag catalogue, which is comparatively expensive on both
+        // stores. The catalogue changes rarely, so results are cached per data source for a short,
+        // configurable TTL (BROWSE_CACHE_SECONDS, 0 disables caching).
+        private readonly object _browseCacheLock = new();
+        private readonly Dictionary<OpcUaDataSourceType, (BrowseResult Result, DateTime CachedUtc)> _browseCache = new();
+
         public OpcUaDataSourceResolver(AdxDataSource adx, InfluxDataSource influx)
         {
             _adx = adx;
             _influx = influx;
         }
+
+        private static int BrowseCacheSeconds =>
+            int.TryParse(Environment.GetEnvironmentVariable("BROWSE_CACHE_SECONDS"), out int parsed) && parsed >= 0
+                ? parsed
+                : 60;
 
         /// <summary>
         /// Resolves the data source from the DATA_SOURCE environment variable, defaulting to ADX.
@@ -81,6 +92,35 @@ namespace UACloudAction.Services
         /// display name), so callers can discover what Read and HistoryRead can query.
         /// </summary>
         public BrowseResult Browse(IOpcUaDataSource dataSource)
+        {
+            int cacheSeconds = BrowseCacheSeconds;
+            if (cacheSeconds > 0)
+            {
+                lock (_browseCacheLock)
+                {
+                    if (_browseCache.TryGetValue(dataSource.SourceType, out var cached)
+                        && (DateTime.UtcNow - cached.CachedUtc) < TimeSpan.FromSeconds(cacheSeconds))
+                    {
+                        return cached.Result;
+                    }
+                }
+            }
+
+            BrowseResult browseResult = BuildBrowseResult(dataSource);
+
+            // Only cache successful enumerations, so a transient failure is retried immediately.
+            if (cacheSeconds > 0 && browseResult.StatusCode == OpcUaStatusCodes.Good)
+            {
+                lock (_browseCacheLock)
+                {
+                    _browseCache[dataSource.SourceType] = (browseResult, DateTime.UtcNow);
+                }
+            }
+
+            return browseResult;
+        }
+
+        private static BrowseResult BuildBrowseResult(IOpcUaDataSource dataSource)
         {
             try
             {

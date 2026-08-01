@@ -11,6 +11,32 @@ namespace UACloudAction.Services
     /// </summary>
     public sealed class InfluxDataSource : IOpcUaDataSource, IDisposable
     {
+        /// <summary>
+        /// Lookback windows probed by <see cref="ReadLatest"/>, narrowest first. The final window
+        /// still bounds the scan so a query can never degrade into a full-bucket read.
+        /// Every miss costs a full HTTP round trip, so the ladder is deliberately kept to two rungs:
+        /// the narrow one answers the common "currently reporting tag" case from a single shard, and
+        /// the wide one catches everything else. Additional intermediate rungs measurably slowed reads
+        /// for tags that report rarely without improving the hit rate.
+        /// </summary>
+        private static readonly string[] LatestLookbackWindows = { "-1h", "-30d" };
+
+        /// <summary>
+        /// Lookback window used to discover the available series during browse. Shorter windows are
+        /// significantly faster; tags that have not reported within the window are not listed.
+        /// Configurable via INFLUX_BROWSE_RANGE (defaults to "-24h").
+        /// </summary>
+        private static string BrowseRange =>
+            Environment.GetEnvironmentVariable("INFLUX_BROWSE_RANGE") ?? "-24h";
+
+        /// <summary>
+        /// Lower bound applied by <see cref="ReadHistory"/> when the request carries no start time.
+        /// Configurable via INFLUX_HISTORY_FLOOR (defaults to "-30d"); set it to "0" to restore the
+        /// previous scan-all-history behaviour at the cost of a full-bucket read.
+        /// </summary>
+        private static string HistoryFloor =>
+            Environment.GetEnvironmentVariable("INFLUX_HISTORY_FLOOR") ?? "-30d";
+
         private readonly object _lock = new();
         private InfluxDBClient? _influxClient;
 
@@ -18,22 +44,33 @@ namespace UACloudAction.Services
 
         public DataValue ReadLatest(string nodeId)
         {
-            // Scan all history (start at the Unix epoch) so the latest value is returned regardless of
-            // how long ago it was ingested; INFLUX_RANGE only applies to windowed history reads.
-            List<DataValue> values = Query(nodeId, "|> last()", rangeStart: "0", rangeStop: "now()");
-            return values.Count > 0
-                ? values[0]
-                : new DataValue { StatusCode = OpcUaStatusCodes.BadNoData };
+            // Probe progressively wider lookback windows instead of scanning from the Unix epoch.
+            // An unbounded range forces InfluxDB to read every shard in the bucket before last()
+            // can pick a point, which regularly exceeds the HTTP client timeout and surfaces as a
+            // TaskCanceledException. A bounded range lets last() be answered from a few shards.
+            foreach (string start in LatestLookbackWindows)
+            {
+                List<DataValue> values = Query(nodeId, "|> last()", rangeStart: start, rangeStop: "now()");
+                if (values.Count > 0)
+                {
+                    return values[0];
+                }
+            }
+
+            return new DataValue { StatusCode = OpcUaStatusCodes.BadNoData };
         }
 
         public List<DataValue> ReadHistory(string nodeId, DateTime startTime, DateTime endTime, uint maxValues)
         {
             // Mirror the ADX path: use the request's absolute times when provided; when a bound is
-            // not given, scan all history (start at the Unix epoch) / up to now, rather than applying
-            // a default window, so both data sources behave identically.
+            // not given, fall back to the configured history floor / up to now.
+            // An open-ended start ("0", the Unix epoch) makes InfluxDB read every shard in the bucket
+            // before it can return anything, which is the slowest possible query and can outlive the
+            // HTTP timeout. When the caller does not supply a lower bound, fall back to a bounded
+            // (configurable) floor instead so the scan stays proportional to the retained data.
             string rangeStart = startTime > DateTime.MinValue
                 ? startTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
-                : "0";
+                : HistoryFloor;
             string rangeStop = endTime < DateTime.MaxValue
                 ? endTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
                 : "now()";
@@ -65,51 +102,86 @@ namespace UACloudAction.Services
             // its "metaName" tag.
             Dictionary<string, string> namespaceByWriter = GetNamespaceByWriter(client, org, bucket, metadataMeasurement);
 
-            // Distinct (datasetWriterId, _field) pairs. Grouping by both columns puts them in the
-            // group key, so last() yields exactly one record per series while keeping both columns
-            // on the record. distinct() cannot be used here because it rejects columns that are
-            // part of the group key.
-            string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
-                + " |> range(start: -30d)"
-                + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(measurement)}\")"
-                + " |> keep(columns: [\"datasetWriterId\", \"_field\", \"_time\", \"_value\"])"
-                + " |> group(columns: [\"datasetWriterId\", \"_field\"])"
-                + " |> last()"
-                + " |> keep(columns: [\"datasetWriterId\", \"_field\"])";
-
-            List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
-            HashSet<string> seen = new(StringComparer.Ordinal);
-            foreach (FluxTable table in tables)
+            // Discovering the available (datasetWriterId, _field) pairs by scanning telemetry
+            // ("range + filter + last()" over the whole browse window) forces the storage engine to
+            // open one series per pair. On a high-cardinality bucket that regularly outlives the HTTP
+            // client timeout and surfaces as a TaskCanceledException. The schema package answers the
+            // same question from the index/metadata only, so enumerate the writers and then the field
+            // keys per writer instead: no point data is read at all.
+            List<string> writers = QueryTagValues(client, org, bucket, measurement, "datasetWriterId", writerFilter: null);
+            if (writers.Count == 0)
             {
-                foreach (FluxRecord record in table.Records)
+                // No writer tag indexed in this window: still list the fields so the browse result is
+                // not empty; the namespace / DataSetName is then simply unknown.
+                writers.Add(string.Empty);
+            }
+
+            HashSet<string> seen = new(StringComparer.Ordinal);
+            foreach (string writer in writers)
+            {
+                string? dataSetName = namespaceByWriter.TryGetValue(writer, out string? dsn) ? dsn : null;
+                string? namespaceUri = OpcUaNodeId.NamespaceUriFromDataSetName(dataSetName);
+                string? applicationUri = OpcUaNodeId.ApplicationUriFromDataSetName(dataSetName);
+
+                string? writerFilter = writer.Length > 0 ? writer : null;
+                foreach (string field in QueryTagValues(client, org, bucket, measurement, "_field", writerFilter))
                 {
-                    string? value = record.GetValueByKey("_field")?.ToString();
-                    if (string.IsNullOrEmpty(value))
-                    {
-                        continue;
-                    }
-
-                    string? writer = record.GetValueByKey("datasetWriterId")?.ToString();
-                    string? dataSetName = writer != null && namespaceByWriter.TryGetValue(writer, out string? dsn)
-                        ? dsn
-                        : null;
-
                     // Stations publish under a shared namespace URI and are distinguished
                     // only by the ApplicationUri, so de-duplicate on (application, field).
                     // De-duplicating on the field alone would collapse all four stations
                     // into a single entry.
-                    string? namespaceUri = OpcUaNodeId.NamespaceUriFromDataSetName(dataSetName);
-                    string? applicationUri = OpcUaNodeId.ApplicationUriFromDataSetName(dataSetName);
-                    if (!seen.Add($"{applicationUri}|{namespaceUri}|{value}"))
+                    if (!seen.Add($"{applicationUri}|{namespaceUri}|{field}"))
                     {
                         continue;
                     }
 
-                    tags.Add(new OpcUaBrowseTag(value, namespaceUri, dataSetName));
+                    tags.Add(new OpcUaBrowseTag(field, namespaceUri, dataSetName));
                 }
             }
 
             return tags;
+        }
+
+        /// <summary>
+        /// Returns the distinct values of <paramref name="tag"/> recorded for the measurement within
+        /// <see cref="BrowseRange"/>, optionally restricted to a single datasetWriterId. This uses the
+        /// schema package, which is answered from metadata rather than by scanning series data, and is
+        /// therefore orders of magnitude cheaper than a "filter + last()" browse query.
+        /// </summary>
+        private List<string> QueryTagValues(InfluxDBClient client, string org, string bucket, string measurement, string tag, string? writerFilter)
+        {
+            string predicate = string.IsNullOrEmpty(writerFilter)
+                ? $"(r) => r._measurement == \"{EscapeFlux(measurement)}\""
+                : $"(r) => r._measurement == \"{EscapeFlux(measurement)}\" and r.datasetWriterId == \"{EscapeFlux(writerFilter)}\"";
+
+            string flux = "import \"influxdata/influxdb/schema\"\n"
+                + $"schema.tagValues(bucket: \"{EscapeFlux(bucket)}\", tag: \"{EscapeFlux(tag)}\", predicate: {predicate}, start: {BrowseRange})";
+
+            List<string> values = new();
+
+            try
+            {
+                List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
+                foreach (FluxTable table in tables)
+                {
+                    foreach (FluxRecord record in table.Records)
+                    {
+                        string? value = record.GetValueByKey("_value")?.ToString();
+                        if (!string.IsNullOrEmpty(value))
+                        {
+                            values.Add(value);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // A failing or timing-out query must not take down the whole browse request:
+                // report no values so the caller can surface BadNoData instead.
+                Console.WriteLine($"InfluxDB browse query for tag '{tag}' failed: {ex.Message}");
+            }
+
+            return values;
         }
 
         /// <summary>
@@ -121,16 +193,18 @@ namespace UACloudAction.Services
             Dictionary<string, string> result = new(StringComparer.Ordinal);
 
             // metaName holds "<ApplicationUri>;<NodeId>" (the DataSetName). Filtering to a
-            // single field (cfgMajor) and taking last() per writer yields exactly one current
-            // row per writer, which is the Flux equivalent of the ADX opcua_metadata_lkv
-            // ("last known value") materialized view. This matches the metadata join used by
-            // the InfluxDB tutorial and the Grafana dashboards.
+            // single field (cfgMajor) and taking last() yields the current row per series, which is
+            // the Flux equivalent of the ADX opcua_metadata_lkv ("last known value") materialized
+            // view. As above, last() is applied directly after range+filter so the query is pushed
+            // down to the storage engine; the newest row per writer is then picked client-side (the
+            // result set is tiny - one row per series).
             string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
-                + " |> range(start: -30d)"
+                + $" |> range(start: {BrowseRange})"
                 + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(metadataMeasurement)}\" and r._field == \"cfgMajor\")"
-                + " |> group(columns: [\"datasetWriterId\"])"
                 + " |> last()"
-                + " |> keep(columns: [\"datasetWriterId\", \"metaName\"])";
+                + " |> keep(columns: [\"datasetWriterId\", \"metaName\", \"_time\"])";
+
+            Dictionary<string, DateTime> newestByWriter = new(StringComparer.Ordinal);
 
             try
             {
@@ -141,8 +215,17 @@ namespace UACloudAction.Services
                     {
                         string? writer = record.GetValueByKey("datasetWriterId")?.ToString();
                         string? metaName = record.GetValueByKey("metaName")?.ToString();
-                        if (!string.IsNullOrEmpty(writer) && !string.IsNullOrEmpty(metaName))
+                        if (string.IsNullOrEmpty(writer) || string.IsNullOrEmpty(metaName))
                         {
+                            continue;
+                        }
+
+                        // Keep the most recent metaName when a writer has several (it can change
+                        // over time); without a group() the query returns one row per series.
+                        DateTime time = record.GetTime()?.ToDateTimeUtc() ?? DateTime.MinValue;
+                        if (!newestByWriter.TryGetValue(writer, out DateTime existing) || time >= existing)
+                        {
+                            newestByWriter[writer] = time;
                             result[writer] = metaName;
                         }
                     }

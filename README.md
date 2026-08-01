@@ -41,6 +41,7 @@ Note: When running on Azure, you need to register UA-CloudAction as an app with 
 * MQTT_RPC_EXPIRY_SECONDS - only used when `MESSAGING_PLATFORM=MQTT`/`AIO`. The MQTT v5 Message Expiry Interval (in seconds) applied to the RPC request message. Defaults to 30.
 * RATE_LIMIT_PERMIT - the maximum number of OPC UA Web API requests allowed per client IP within each rate-limit window. Defaults to 60.
 * RATE_LIMIT_WINDOW_SECONDS - the length (in seconds) of the fixed rate-limit window for the OPC UA Web API. Defaults to 60.
+* BROWSE_CACHE_SECONDS - how long (in seconds) a successful OPC UA Web API `browse` result is cached per data source. The tag catalogue changes rarely and enumerating it is comparatively expensive, so caching it markedly speeds up repeated browse calls. Defaults to 60; set to 0 to disable caching.
 
 ## Calling UA Cloud Commander in Azure IoT Operations (AIO)
 
@@ -64,13 +65,16 @@ Set `DATA_SOURCE` to `InfluxDB` (or `Influx`) to query an InfluxDB (Flux) time-s
 
 * INFLUX_URL - the InfluxDB endpoint. Defaults to "http://influxdb.default.svc.cluster.local:8086".
 * INFLUX_TOKEN - the InfluxDB API token. Required (no default); the query is skipped when not set.
+* INFLUX_TIMEOUT_SECONDS - the HTTP timeout (in seconds) for InfluxDB queries. The client default of 10 seconds is regularly exceeded by browse-style queries that scan many days of data (surfacing as a `TaskCanceledException`), so this defaults to 120.
 * INFLUX_ORG - the InfluxDB organization. Defaults to "iot".
 * INFLUX_BUCKET - the InfluxDB bucket to query. Defaults to "mqtt".
 * INFLUX_MEASUREMENT - the measurement name to filter on. Defaults to "opcua_pubsub".
 * INFLUX_METADATA_MEASUREMENT - the measurement holding the OPC UA metadata used by the Web API `browse` operation (it shares the `datasetWriterId` tag with the telemetry and carries the DataSetName in its `metaName` tag). Defaults to "opcua_metadata".
 * INFLUX_FIELD - the field name to read the latest value from. Required (no default); the query is skipped when not set.
-* INFLUX_RANGE - the Flux range start used for the query (e.g. "-1m"). Defaults to "-1m".
+* INFLUX_TRIGGER_RANGE - the Flux lookback window used by the high-pressure **trigger** query (how far back it looks for the latest value of `INFLUX_FIELD`). Defaults to "-1m". `INFLUX_RANGE` is accepted as a deprecated alias for this variable.
+* INFLUX_RANGE - deprecated alias for `INFLUX_TRIGGER_RANGE`, kept for backwards compatibility. Prefer `INFLUX_TRIGGER_RANGE`.
 * INFLUX_THRESHOLD - the numeric threshold above which the high-value (high-pressure) trigger fires. Defaults to 4000.0.
+* INFLUX_BROWSE_RANGE - the Flux lookback window used to discover the available series during the Web API **`browse`** operation (unrelated to `INFLUX_TRIGGER_RANGE`, which only bounds the trigger query). Shorter windows are significantly faster, but tags that have not reported within the window are not listed. Defaults to "-24h"; widen it (e.g. "-30d") if you have tags that report less frequently.
 
 ## OPC UA Web API (ADX and InfluxDB Data Sources)
 

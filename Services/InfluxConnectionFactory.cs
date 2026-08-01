@@ -22,7 +22,20 @@ namespace UACloudAction.Services
                 return null;
             }
 
-            return new InfluxDBClient(url, token);
+            // The default HTTP timeout is only 10 seconds, which browse-style queries that scan
+            // many days of data regularly exceed. Exceeding it aborts the socket read and surfaces
+            // as a TaskCanceledException, so use a longer, configurable timeout instead.
+            int timeoutSeconds = int.TryParse(Environment.GetEnvironmentVariable("INFLUX_TIMEOUT_SECONDS"), out int parsed) && parsed > 0
+                ? parsed
+                : 120;
+
+            InfluxDBClientOptions options = new InfluxDBClientOptions.Builder()
+                .Url(url)
+                .AuthenticateToken(token)
+                .TimeOut(TimeSpan.FromSeconds(timeoutSeconds))
+                .Build();
+
+            return new InfluxDBClient(options);
         }
     }
 }

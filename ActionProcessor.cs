@@ -165,7 +165,14 @@ namespace UACloudAction
             string bucket = Environment.GetEnvironmentVariable("INFLUX_BUCKET") ?? "mqtt";
             string measurement = Environment.GetEnvironmentVariable("INFLUX_MEASUREMENT") ?? "opcua_pubsub";
             string? field = Environment.GetEnvironmentVariable("INFLUX_FIELD");
-            string range = Environment.GetEnvironmentVariable("INFLUX_RANGE") ?? "-1m";
+
+            // Lookback window for the trigger query only (not to be confused with
+            // INFLUX_BROWSE_RANGE, which bounds the Web API browse discovery). INFLUX_RANGE is kept
+            // as a backwards-compatible alias for the older, less descriptive name.
+            string range = Environment.GetEnvironmentVariable("INFLUX_TRIGGER_RANGE")
+                ?? Environment.GetEnvironmentVariable("INFLUX_RANGE")
+                ?? "-1m";
+
             double threshold = double.TryParse(Environment.GetEnvironmentVariable("INFLUX_THRESHOLD"), out double parsedThreshold) ? parsedThreshold : 4000.0;
 
             if (string.IsNullOrEmpty(field))
