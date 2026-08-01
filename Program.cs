@@ -112,7 +112,12 @@ app.UseRateLimiter();
 app.UseSwagger();
 app.UseSwaggerUI(options =>
 {
-    options.SwaggerEndpoint("/swagger/v1/swagger.json", "UA-CloudAction OPC UA Web API v1");
+    // Relative to the Swagger UI route prefix, so the document is still resolved correctly when
+    // the app is served behind a reverse proxy that adds a path prefix (e.g. Container Apps or an
+    // ingress controller). An absolute "/swagger/v1/swagger.json" would bypass that prefix and
+    // return the proxy's HTML page, which Swagger UI rejects with "does not specify a valid
+    // version field".
+    options.SwaggerEndpoint("v1/swagger.json", "UA-CloudAction OPC UA Web API v1");
 });
 
 _ = Task.Run(() => app.Services.GetService<ActionProcessor>()?.Run());
