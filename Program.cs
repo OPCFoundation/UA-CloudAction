@@ -1,7 +1,7 @@
 
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.HttpOverrides;
-using Microsoft.OpenApi.Models;
+using Microsoft.OpenApi;
 using System.Threading.RateLimiting;
 using UACloudAction;
 
@@ -29,18 +29,11 @@ builder.Services.AddSwaggerGen(options =>
         Description = "HTTP Basic authentication using the ADMIN_USERNAME / ADMIN_PASSWORD credentials."
     });
 
-    options.AddSecurityRequirement(new OpenApiSecurityRequirement
+    options.AddSecurityRequirement(document => new OpenApiSecurityRequirement
     {
         {
-            new OpenApiSecurityScheme
-            {
-                Reference = new OpenApiReference
-                {
-                    Type = ReferenceType.SecurityScheme,
-                    Id = basicScheme
-                }
-            },
-            Array.Empty<string>()
+            new OpenApiSecuritySchemeReference(basicScheme),
+            new List<string>()
         }
     });
 });

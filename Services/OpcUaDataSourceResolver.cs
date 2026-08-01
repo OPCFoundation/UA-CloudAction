@@ -124,7 +124,7 @@ namespace UACloudAction.Services
             }
             catch (Exception ex)
             {
-                Console.WriteLine(ex.Message);
+                Console.WriteLine("Browse failed: " + ex);
                 return new BrowseResult { StatusCode = OpcUaStatusCodes.BadUnexpectedError };
             }
         }

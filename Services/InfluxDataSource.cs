@@ -65,15 +65,17 @@ namespace UACloudAction.Services
             // its "metaName" tag.
             Dictionary<string, string> namespaceByWriter = GetNamespaceByWriter(client, org, bucket, metadataMeasurement);
 
-            // Distinct (datasetWriterId, _field) pairs. Grouping by both columns keeps
-            // datasetWriterId in the group key so it survives into each record; a bare
-            // group()/distinct() would drop it and lose the writer association.
+            // Distinct (datasetWriterId, _field) pairs. Grouping by both columns puts them in the
+            // group key, so last() yields exactly one record per series while keeping both columns
+            // on the record. distinct() cannot be used here because it rejects columns that are
+            // part of the group key.
             string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
                 + " |> range(start: -30d)"
                 + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(measurement)}\")"
-                + " |> keep(columns: [\"datasetWriterId\", \"_field\"])"
+                + " |> keep(columns: [\"datasetWriterId\", \"_field\", \"_time\", \"_value\"])"
                 + " |> group(columns: [\"datasetWriterId\", \"_field\"])"
-                + " |> distinct(column: \"_field\")";
+                + " |> last()"
+                + " |> keep(columns: [\"datasetWriterId\", \"_field\"])";
 
             List<FluxTable> tables = client.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
             HashSet<string> seen = new(StringComparer.Ordinal);
@@ -81,7 +83,7 @@ namespace UACloudAction.Services
             {
                 foreach (FluxRecord record in table.Records)
                 {
-                    string? value = record.GetValue()?.ToString();
+                    string? value = record.GetValueByKey("_field")?.ToString();
                     if (string.IsNullOrEmpty(value))
                     {
                         continue;
