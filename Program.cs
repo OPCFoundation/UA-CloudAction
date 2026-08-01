@@ -103,22 +103,30 @@ app.UseStaticFiles();
 
 app.UseRouting();
 
-app.UseAuthentication();
-
-app.UseAuthorization();
-
-app.UseRateLimiter();
-
-app.UseSwagger();
+// Swagger is served before authentication, authorization and rate limiting so the document is
+// always returned as JSON. When it is served after them, an unauthenticated request is redirected
+// to the login page (or rejected by the rate limiter) and Swagger UI receives HTML instead of the
+// document, which it reports as "does not specify a valid version field".
+app.UseSwagger(options =>
+{
+    // Pin the document to OpenAPI 3.0; Swashbuckle 10 / Microsoft.OpenApi 2 default to emitting
+    // 3.1, which some Swagger UI and client-generator versions refuse to render.
+    options.OpenApiVersion = Microsoft.OpenApi.OpenApiSpecVersion.OpenApi3_0;
+});
 app.UseSwaggerUI(options =>
 {
     // Relative to the Swagger UI route prefix, so the document is still resolved correctly when
     // the app is served behind a reverse proxy that adds a path prefix (e.g. Container Apps or an
     // ingress controller). An absolute "/swagger/v1/swagger.json" would bypass that prefix and
-    // return the proxy's HTML page, which Swagger UI rejects with "does not specify a valid
-    // version field".
+    // return the proxy's HTML page.
     options.SwaggerEndpoint("v1/swagger.json", "UA-CloudAction OPC UA Web API v1");
 });
+
+app.UseAuthentication();
+
+app.UseAuthorization();
+
+app.UseRateLimiter();
 
 _ = Task.Run(() => app.Services.GetService<ActionProcessor>()?.Run());
 
