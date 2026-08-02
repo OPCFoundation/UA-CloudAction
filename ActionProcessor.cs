@@ -1,13 +1,10 @@
 ﻿
 namespace UACloudAction
 {
-    using Azure.Identity;
     using Confluent.Kafka;
     using InfluxDB.Client;
     using InfluxDB.Client.Core.Flux.Domain;
-    using Kusto.Data;
     using Kusto.Data.Common;
-    using Kusto.Data.Net.Client;
     using MQTTnet;
     using MQTTnet.Formatter;
     using MQTTnet.Protocol;
@@ -155,6 +152,68 @@ namespace UACloudAction
             return false;
         }
 
+        // Returns the datasetWriterIds whose metadata DataSetName contains both the configured UA server
+        // application name and location name. This is the Flux equivalent of the two
+        // "where DataSetName contains '...'" clauses in RunAdxQuery. An empty list means "no scoping
+        // possible", in which case the caller falls back to the unscoped field-only filter.
+        private List<string> GetInfluxWriters(string metadataMeasurement, string org, string bucket, string? applicationName, string? locationName)
+        {
+            List<string> writers = new();
+
+            if (string.IsNullOrEmpty(applicationName) && string.IsNullOrEmpty(locationName))
+            {
+                return writers;
+            }
+
+            string metaFilter = string.Empty;
+            if (!string.IsNullOrEmpty(applicationName))
+            {
+                metaFilter += $" |> filter(fn: (r) => strings.containsStr(v: r.metaName, substr: \"{EscapeFlux(applicationName)}\"))";
+            }
+
+            if (!string.IsNullOrEmpty(locationName))
+            {
+                metaFilter += $" |> filter(fn: (r) => strings.containsStr(v: r.metaName, substr: \"{EscapeFlux(locationName)}\"))";
+            }
+
+            string flux = "import \"strings\"\n"
+                        + $"from(bucket: \"{EscapeFlux(bucket)}\")"
+                        + " |> range(start: -30d)"
+                        + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(metadataMeasurement)}\")"
+                        + metaFilter
+                        + " |> keep(columns: [\"datasetWriterId\"])"
+                        + " |> group()"
+                        + " |> distinct(column: \"datasetWriterId\")";
+
+            try
+            {
+                List<FluxTable> tables = _influxClient!.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
+                foreach (FluxTable table in tables)
+                {
+                    foreach (FluxRecord record in table.Records)
+                    {
+                        string? value = record.GetValue()?.ToString();
+                        if (!string.IsNullOrEmpty(value))
+                        {
+                            writers.Add(value);
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Treated as "no match": the caller falls back to a field-only filter.
+            }
+
+            return writers;
+        }
+
+        private static string EscapeFlux(string value)
+        {
+            // Escape for a double-quoted Flux string literal.
+            return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
         // Queries InfluxDB (Flux) for the latest value of the configured field over the configured
         // range and returns true when it exceeds the configured threshold (the high-pressure trigger).
         private bool RunInfluxQuery(out string detectedValue)
@@ -164,7 +223,10 @@ namespace UACloudAction
             string org = Environment.GetEnvironmentVariable("INFLUX_ORG") ?? "iot";
             string bucket = Environment.GetEnvironmentVariable("INFLUX_BUCKET") ?? "mqtt";
             string measurement = Environment.GetEnvironmentVariable("INFLUX_MEASUREMENT") ?? "opcua_pubsub";
+            string metadataMeasurement = Environment.GetEnvironmentVariable("INFLUX_METADATA_MEASUREMENT") ?? "opcua_metadata";
             string? field = Environment.GetEnvironmentVariable("INFLUX_FIELD");
+            string? uaServerApplicationName = Environment.GetEnvironmentVariable("UA_SERVER_APPLICATION_NAME");
+            string? uaServerLocationName = Environment.GetEnvironmentVariable("UA_SERVER_LOCATION_NAME");
 
             // Lookback window for the trigger query only (not to be confused with
             // INFLUX_BROWSE_RANGE, which bounds the Web API browse discovery). INFLUX_RANGE is kept
@@ -193,12 +255,25 @@ namespace UACloudAction
 
                 ConnectionToInflux = true;
 
+                // Scope the trigger to the configured UA server, mirroring the ADX query which matches
+                // the metadata DataSetName against both the application and the location name. Without
+                // this the query returns the latest Pressure of *every* publisher, so a high value on a
+                // station we never actuate would re-trigger the action forever.
+                string writerFilter = string.Empty;
+                List<string> writers = GetInfluxWriters(metadataMeasurement, org, bucket, uaServerApplicationName, uaServerLocationName);
+                if (writers.Count > 0)
+                {
+                    string writerSet = string.Join(", ", writers.Select(w => $"\"{EscapeFlux(w)}\""));
+                    writerFilter = $" |> filter(fn: (r) => contains(value: r.datasetWriterId, set: [{writerSet}]))";
+                }
+
                 // Latest value of the field within the range; the threshold comparison is done in code so a
                 // non-numeric field is handled gracefully.
-                string flux = $"from(bucket: \"{bucket}\")"
+                string flux = $"from(bucket: \"{EscapeFlux(bucket)}\")"
                             + $" |> range(start: {range})"
-                            + $" |> filter(fn: (r) => r._measurement == \"{measurement}\")"
-                            + $" |> filter(fn: (r) => r._field == \"{field}\")"
+                            + $" |> filter(fn: (r) => r._measurement == \"{EscapeFlux(measurement)}\")"
+                            + $" |> filter(fn: (r) => r._field == \"{EscapeFlux(field)}\")"
+                            + writerFilter
                             + " |> last()";
 
                 List<FluxTable> tables = _influxClient.GetQueryApi().QueryAsync(flux, org).GetAwaiter().GetResult();
